@@ -26,7 +26,7 @@ go run ./cmd/zephyr-gen -input workflows/checkout.zephyr -output ./generated
 go run ./cmd/zephyr-server -addr 127.0.0.1:9090 -db ./zephyr-local.db -workflows ./workflows
 ```
 
-Set `ZEPHYR_SERVER_TOKEN` or pass `-token` to protect API routes with a static bearer token. Enter it in the portal's API Token field. The portal itself remains available without authentication. This is a minimal local option, not production identity management.
+Local mode can use `ZEPHYR_SERVER_TOKEN` or `-token` for static bearer authentication. The portal remains available without authentication when no token is configured. This is a local development option, not production identity management.
 
 The local server uses an in-memory work queue, lease manager, and timer service. SQLite preserves execution history across restarts, but queued work, active leases, and scheduled deadlines are process-local. A worker must be running and configured to reach this server to execute tasks; otherwise runs with task nodes remain pending.
 
@@ -50,11 +50,20 @@ Supported environment variables and corresponding flags:
 | --- | --- | --- |
 | `DATABASE_URL` | `-postgres-url` | PostgreSQL connection URL; required with `AMQP_URL` for distributed mode and required by `-migrate-only` |
 | `AMQP_URL` | `-amqp-url` | RabbitMQ connection URL; required with `DATABASE_URL` for distributed mode |
+| `OIDC_ISSUER_URL` | — | OIDC discovery issuer; required in distributed mode unless the explicit development-only static-auth switch is enabled |
+| `OIDC_CLIENT_ID` | — | OIDC portal client ID |
+| `OIDC_CLIENT_SECRET` | — | Optional secret for confidential OIDC clients; PKCE is used either way |
+| `OIDC_API_AUDIENCE` | — | Expected audience for signed worker/API access tokens |
+| `OIDC_REDIRECT_URL` | — | Absolute public callback URL ending in `/auth/callback` |
+| `OIDC_COOKIE_HASH_KEY` | — | Base64-encoded 32-byte session-cookie signing key |
+| `OIDC_COOKIE_BLOCK_KEY` | — | Base64-encoded 32-byte session-cookie encryption key |
+| `OIDC_SCOPES` | — | Optional space-separated portal login scopes; defaults to workflow read/start |
+| `ZEPHYR_DEV_STATIC_AUTH` | — | Must be `true` with `ZEPHYR_ENV=development` to use the local static-token path in distributed mode |
 | `ZEPHYR_HTTP_ADDR` | `-addr` | `127.0.0.1:8080`; use `0.0.0.0:8080` in a container |
 | `ZEPHYR_TASK_QUEUE` | `-task-queue` | `zephyr-tasks` |
 | `ZEPHYR_COMPLETION_QUEUE` | `-completion-queue` | `zephyr-completions` |
 | `ZEPHYR_WORKFLOWS_DIR` | `-workflows` | `workflows` |
-| `ZEPHYR_SERVER_TOKEN` | `-token` | Empty disables API bearer authentication |
+| `ZEPHYR_SERVER_TOKEN` | `-token` | Static bearer token for local mode or explicitly enabled development-only distributed mode |
 
 If only one of the two distributed connection URLs is set, startup fails rather than silently using local mode. Apply PostgreSQL migrations once before running a distributed server:
 
@@ -90,7 +99,7 @@ docker compose -f deploy/compose.yaml ps
 curl -fsS http://127.0.0.1:8080/readyz
 ```
 
-To enable API bearer authentication, set `ZEPHYR_SERVER_TOKEN` in the shell before starting Compose. Stop the stack with `docker compose -f deploy/compose.yaml down`; this retains the named database and broker volumes. `down -v` also deletes those local volumes.
+Compose binds the HTTP port to loopback and enables the explicitly development-only static-token path with a local sample token. Override `ZEPHYR_SERVER_TOKEN` before starting the stack if desired; do not reuse this mode or token in production. Stop the stack with `docker compose -f deploy/compose.yaml down`; this retains the named database and broker volumes. `down -v` also deletes those local volumes.
 
 ## Kubernetes
 
@@ -102,13 +111,28 @@ docker build -t "$IMAGE" .
 docker push "$IMAGE"
 ```
 
-Create the referenced Secret in the target namespace using connection URLs for your externally managed services. Set these shell variables through your normal secret-handling process first; the token is optional, but without it API bearer authentication is disabled.
+Create the referenced Secret in the target namespace using connection URLs and OIDC client settings for your externally managed identity provider. Register `OIDC_REDIRECT_URL` as an exact callback URL at the provider, ending in `/auth/callback`. Generate independent cookie keys with `openssl rand -base64 32`; the issuer must expose standard OIDC discovery and sign JWT access tokens for the configured API audience. Configure provider scopes/roles so portal users can receive `zephyr:workflow:read` and `zephyr:workflow:start`, and worker identities can receive `zephyr:worker:execute`. The `zephyr:admin` scope grants all API scopes.
 
 ```sh
+export OIDC_ISSUER_URL=https://identity.example.com/
+export OIDC_CLIENT_ID=zephyr-portal
+export OIDC_API_AUDIENCE=zephyr-api
+export OIDC_REDIRECT_URL=https://zephyr.example.com/auth/callback
+export OIDC_COOKIE_HASH_KEY="$(openssl rand -base64 32)"
+export OIDC_COOKIE_BLOCK_KEY="$(openssl rand -base64 32)"
+export OIDC_SCOPES="zephyr:workflow:read zephyr:workflow:start"
+
 kubectl create secret generic zephyr-runtime \\
 	--from-literal=DATABASE_URL="$DATABASE_URL" \\
-	--from-literal=AMQP_URL="$AMQP_URL" \\
-	--from-literal=ZEPHYR_SERVER_TOKEN="${ZEPHYR_SERVER_TOKEN:-}"
+	--from-literal=AMQP_URL="$AMQP_URL" \
+	--from-literal=OIDC_ISSUER_URL="$OIDC_ISSUER_URL" \
+	--from-literal=OIDC_CLIENT_ID="$OIDC_CLIENT_ID" \
+	--from-literal=OIDC_CLIENT_SECRET="${OIDC_CLIENT_SECRET:-}" \
+	--from-literal=OIDC_API_AUDIENCE="$OIDC_API_AUDIENCE" \
+	--from-literal=OIDC_REDIRECT_URL="$OIDC_REDIRECT_URL" \
+	--from-literal=OIDC_COOKIE_HASH_KEY="$OIDC_COOKIE_HASH_KEY" \
+	--from-literal=OIDC_COOKIE_BLOCK_KEY="$OIDC_COOKIE_BLOCK_KEY" \
+	--from-literal=OIDC_SCOPES="$OIDC_SCOPES"
 ```
 
 After replacing both manifest image references and configuring the Secret, apply and wait for the migration Job before creating/updating the server Deployment:
@@ -128,7 +152,7 @@ The Deployment has two replicas, readiness/liveness/startup probes, a 30-second 
 
 The distributed server stores leases and fencing tokens in PostgreSQL, serializes decider advancement with PostgreSQL advisory locks, and recovers retry/delay deadlines and expired leases from persisted state. The two-instance integration test exercises independent gateways over shared PostgreSQL and RabbitMQ. The timer heap and broker mailbox are still process-local accelerators; persisted workflow deadlines, lease rows, and task IDs are the recovery authority.
 
-These artifacts provide a runnable distributed deployment path, not a claim of production readiness. `ZEPHYR_SERVER_TOKEN` is a single static bearer token, not user identity, authorization, rotation, or audit integration; the web portal remains accessible without authentication. Put the HTTP service behind TLS and use an identity-aware edge where required.
+These artifacts provide a runnable distributed deployment path, not a claim of production readiness. Distributed mode requires OIDC discovery, signed access tokens with the configured audience, protected portal sessions, and endpoint scopes; static bearer auth is accepted only when explicitly enabled with `ZEPHYR_ENV=development`. The server does not implement provider logout or token refresh; sessions expire with the access token and users sign in again. Put the HTTP service behind TLS and configure the public OIDC callback URL consistently with the ingress/proxy.
 
 Workflow definitions are baked into the image and loaded at process startup. Treat the workflow bundle as immutable for each image release, deploy the same bundle to every replica, and roll out a new image to change definitions; there is no runtime upload or synchronized reload.
 

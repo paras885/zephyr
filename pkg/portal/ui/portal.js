@@ -3,7 +3,9 @@
   const state = { workflows: [], runs: [], total: 0, metrics: {}, offset: 0, selectedWorkflow: '', selectedRun: '', workflowSignature: '', runSignature: '', refreshing: false };
   const byId = (id) => document.getElementById(id);
   const tokenInput = byId('api-token');
-  tokenInput.value = sessionStorage.getItem('zephyr-token') || '';
+  const tokenField = byId('token-field');
+  const signOutButton = byId('sign-out-button');
+  let oidcMode = false;
 
   function escapeHTML(value) {
     return String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
@@ -21,8 +23,34 @@
     });
     const contentType = response.headers.get('content-type') || '';
     const body = contentType.includes('application/json') ? await response.json() : await response.text();
+    if (response.status === 401 && oidcMode) {
+      window.location.assign('/auth/login');
+      throw new Error('Your sign-in session expired');
+    }
     if (!response.ok) throw new Error(body?.error || `Request failed (${response.status})`);
     return body;
+  }
+
+  async function configureAuthentication() {
+    const response = await fetch('/auth/session', { credentials: 'same-origin' });
+    if (response.ok && (response.headers.get('content-type') || '').includes('application/json')) {
+      const session = await response.json();
+      if (session.authenticated === true) {
+        oidcMode = true;
+        tokenField.hidden = true;
+        signOutButton.hidden = false;
+        return true;
+      }
+    }
+    if (response.status === 404 || response.ok) {
+      tokenInput.value = sessionStorage.getItem('zephyr-token') || '';
+      return true;
+    }
+    if (response.status === 401) {
+      window.location.assign('/auth/login');
+      return false;
+    }
+    throw new Error(`Could not check sign-in status (${response.status})`);
   }
 
   function showToast(message, isError = false) {
@@ -323,6 +351,10 @@
     }
   });
   tokenInput.addEventListener('change', () => { sessionStorage.setItem('zephyr-token', tokenInput.value.trim()); refresh(); });
+  signOutButton.addEventListener('click', async () => {
+    const response = await fetch('/auth/logout', { method: 'POST', credentials: 'same-origin' });
+    if (response.ok) window.location.assign('/auth/login');
+  });
   document.querySelectorAll('[data-view]').forEach((button) => button.addEventListener('click', () => {
     document.querySelectorAll('[data-view]').forEach((item) => item.classList.toggle('active', item === button));
     const workflows = button.dataset.view === 'workflows';
@@ -332,6 +364,9 @@
     document.getElementById(workflows ? 'workflow-section' : 'runs-section').scrollIntoView({ behavior: 'smooth', block: 'start' });
   }));
 
-  refresh();
-  setInterval(refresh, 5000);
+  configureAuthentication().then((ready) => {
+    if (!ready) return;
+    refresh();
+    setInterval(refresh, 5000);
+  }).catch((error) => showToast(error.message, true));
 })();

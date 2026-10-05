@@ -6,6 +6,8 @@ This document is the execution plan for taking Zephyr from its current multi-ins
 
 ## Current Baseline
 
+Implementation progress: Phases 1-3 have been implemented and validated in commits `1ce29cd`, `377e73e`, and the current Phase 3 work. Phases 4-5 and the final production-readiness gate remain open; implementation does not replace provider/cluster-specific configuration or operational drills.
+
 The repository already includes:
 
 - Opt-in distributed `zephyr-server` mode configured with `DATABASE_URL` and `AMQP_URL`; local mode remains SQLite plus in-memory queue, lease, and timer implementations.
@@ -21,7 +23,7 @@ Useful entry points: [README.md](README.md), [ROADMAP.md](ROADMAP.md), [cmd/zeph
 
 1. Lease-state changes and workflow events currently commit in separate PostgreSQL transactions. A process/database failure between them can leave the lease and workflow task state inconsistent; idempotent reconciliation reduces impact but is weaker than atomic commit.
 2. RabbitMQ connection/channel closure currently makes a replica unready; the process relies on orchestration restart rather than supervised reconnect and consumer recovery.
-3. Static bearer-token authentication is not production identity or authorization. The portal remains accessible without API authentication.
+3. OIDC/JWT validation, endpoint scopes, and PKCE-protected portal sessions are implemented. Deployment still requires provider-specific issuer/client/audience/scope configuration, secret provisioning/rotation, TLS, and validation against the target identity provider.
 4. The Kubernetes manifests have been parsed locally, but have not been applied to a real cluster or tested for rollout, drain, failure, upgrade, or rollback behavior.
 5. RabbitMQ durability, queue replication/HA, dead-lettering, delivery limits, PostgreSQL backups/PITR, restore procedures, and capacity limits need explicit deployment policy and verification.
 6. Operational telemetry, alerts, runbooks, threat review, load/fault testing, and security scanning are not yet established as release gates.

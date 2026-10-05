@@ -31,7 +31,8 @@
       <header class="topbar">
         <div class="breadcrumbs"><span>Operations</span><span class="crumb-slash">/</span><strong id="breadcrumb-current">Overview</strong></div>
         <div class="topbar-actions">
-          <label class="token-field"><span>API TOKEN</span><input id="api-token" type="password" autocomplete="off" placeholder="Optional" aria-label="Optional API token"></label>
+          <label class="token-field" id="token-field"><span>LOCAL API TOKEN</span><input id="api-token" type="password" autocomplete="off" placeholder="Optional" aria-label="Local development API token"></label>
+          <button class="button button-quiet" id="sign-out-button" type="button" hidden>Sign out</button>
           <button class="button button-quiet" id="refresh-button" type="button"><span class="refresh-glyph">↻</span> Refresh</button>
           <button class="button button-primary" id="start-button" type="button"><span>＋</span> Start workflow</button>
         </div>

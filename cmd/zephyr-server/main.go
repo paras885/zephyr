@@ -33,7 +33,7 @@ func main() {
 	taskQueue := flag.String("task-queue", envOr("ZEPHYR_TASK_QUEUE", "zephyr-tasks"), "RabbitMQ task queue name")
 	completionQueue := flag.String("completion-queue", envOr("ZEPHYR_COMPLETION_QUEUE", "zephyr-completions"), "RabbitMQ completion queue name")
 	workflowDirectory := flag.String("workflows", envOr("ZEPHYR_WORKFLOWS_DIR", "workflows"), "directory containing .zephyr definitions")
-	token := flag.String("token", os.Getenv("ZEPHYR_SERVER_TOKEN"), "optional static bearer token (or ZEPHYR_SERVER_TOKEN)")
+	token := flag.String("token", os.Getenv("ZEPHYR_SERVER_TOKEN"), "local or development-only static bearer token (or ZEPHYR_SERVER_TOKEN)")
 	migrateOnly := flag.Bool("migrate-only", false, "apply PostgreSQL schema migrations and exit")
 	flag.Parse()
 
@@ -49,6 +49,16 @@ func main() {
 				Address: *address, PostgresURL: *postgresURL, AMQPURL: *amqpURL,
 				TaskQueue: *taskQueue, CompletionQueue: *completionQueue,
 				WorkflowDirectory: *workflowDirectory, Token: *token,
+				Environment:           os.Getenv("ZEPHYR_ENV"),
+				DevelopmentStaticAuth: strings.EqualFold(os.Getenv("ZEPHYR_DEV_STATIC_AUTH"), "true"),
+				OIDCIssuerURL:         os.Getenv("OIDC_ISSUER_URL"),
+				OIDCClientID:          os.Getenv("OIDC_CLIENT_ID"),
+				OIDCClientSecret:      os.Getenv("OIDC_CLIENT_SECRET"),
+				OIDCAudience:          os.Getenv("OIDC_API_AUDIENCE"),
+				OIDCRedirectURL:       os.Getenv("OIDC_REDIRECT_URL"),
+				OIDCCookieHashKey:     os.Getenv("OIDC_COOKIE_HASH_KEY"),
+				OIDCCookieBlockKey:    os.Getenv("OIDC_COOKIE_BLOCK_KEY"),
+				OIDCScopes:            oidcScopesFromEnv(os.Getenv("OIDC_SCOPES")),
 			})
 		}
 	default:

@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 	"github.com/zephyr-workflow/zephyr/pkg/queue"
 	"github.com/zephyr-workflow/zephyr/pkg/store"
 	"github.com/zephyr-workflow/zephyr/pkg/timer"
+	"github.com/zephyr-workflow/zephyr/pkg/token"
 )
 
 func TestConfigFromEnv(t *testing.T) {
@@ -76,6 +79,58 @@ func TestStartWorkflowUsesGatewayContract(t *testing.T) {
 	}
 	if run.ID != "workflow-42" {
 		t.Fatalf("workflow ID = %q, want workflow-42", run.ID)
+	}
+}
+
+func TestClientUsesFreshAccessTokenSource(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		requests++
+		if request.Header.Get("Authorization") != fmt.Sprintf("Bearer access-%d", requests) {
+			t.Errorf("request %d authorization = %q", requests, request.Header.Get("Authorization"))
+		}
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{"id":"workflow-42","status":"COMPLETED"}`))
+	}))
+	defer server.Close()
+	var issued int
+	client, err := New(Config{
+		Endpoint: server.URL, Timeout: time.Second,
+		TokenSource: token.SourceFunc(func(context.Context) (string, error) {
+			issued++
+			return fmt.Sprintf("access-%d", issued), nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.StartWorkflow(context.Background(), "Checkout", 1, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.GetWorkflowRun(context.Background(), "workflow-42"); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 2 || issued != 2 {
+		t.Fatalf("requests=%d issued tokens=%d, want 2 each", requests, issued)
+	}
+}
+
+func TestClientTokenSourceFailureStopsRequest(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests++ }))
+	defer server.Close()
+	client, err := New(Config{
+		Endpoint: server.URL, Timeout: time.Second,
+		TokenSource: token.SourceFunc(func(context.Context) (string, error) { return "", errors.New("identity unavailable") }),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.StartWorkflow(context.Background(), "Checkout", 1, nil); err == nil || !strings.Contains(err.Error(), "identity unavailable") {
+		t.Fatalf("StartWorkflow() error = %v", err)
+	}
+	if requests != 0 {
+		t.Fatalf("made %d unauthenticated requests", requests)
 	}
 }
 

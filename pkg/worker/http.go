@@ -10,14 +10,20 @@ import (
 	"strings"
 
 	"github.com/zephyr-workflow/zephyr/pkg/gateway"
+	"github.com/zephyr-workflow/zephyr/pkg/token"
 )
 
 type HTTPTransport struct {
-	baseURL string
-	client  *http.Client
+	baseURL     string
+	client      *http.Client
+	tokenSource token.Source
 }
 
 func NewHTTPTransport(baseURL string, client *http.Client) (*HTTPTransport, error) {
+	return NewHTTPTransportWithTokenSource(baseURL, client, nil)
+}
+
+func NewHTTPTransportWithTokenSource(baseURL string, client *http.Client, tokenSource token.Source) (*HTTPTransport, error) {
 	baseURL = strings.TrimRight(baseURL, "/")
 	if baseURL == "" {
 		return nil, fmt.Errorf("gateway URL is required")
@@ -25,7 +31,7 @@ func NewHTTPTransport(baseURL string, client *http.Client) (*HTTPTransport, erro
 	if client == nil {
 		client = http.DefaultClient
 	}
-	return &HTTPTransport{baseURL: baseURL, client: client}, nil
+	return &HTTPTransport{baseURL: baseURL, client: client, tokenSource: tokenSource}, nil
 }
 
 func (transport *HTTPTransport) Receive(ctx context.Context, request gateway.ReceiveWorkRequest) (gateway.WorkDelivery, error) {
@@ -56,6 +62,16 @@ func (transport *HTTPTransport) post(ctx context.Context, path string, input, ou
 		return fmt.Errorf("create gateway request: %w", err)
 	}
 	request.Header.Set("Content-Type", "application/json")
+	if transport.tokenSource != nil {
+		token, err := transport.tokenSource.Token(ctx)
+		if err != nil {
+			return fmt.Errorf("get worker API access token: %w", err)
+		}
+		if strings.TrimSpace(token) == "" {
+			return fmt.Errorf("worker API token source returned an empty token")
+		}
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
 	response, err := transport.client.Do(request)
 	if err != nil {
 		return err

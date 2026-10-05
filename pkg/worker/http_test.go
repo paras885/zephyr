@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/zephyr-workflow/zephyr/pkg/gateway"
 	"github.com/zephyr-workflow/zephyr/pkg/queue"
+	"github.com/zephyr-workflow/zephyr/pkg/token"
 )
 
 type testPayload struct {
@@ -100,5 +102,38 @@ func TestHTTPTransportPreservesLeaseConflict(t *testing.T) {
 	var httpErr *HTTPError
 	if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusConflict || httpErr.Message != "lease expired" {
 		t.Fatalf("heartbeat error = %v, want HTTP 409 lease expired", err)
+	}
+}
+
+func TestHTTPTransportUsesFreshAccessTokenSource(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		requests++
+		if request.Header.Get("Authorization") != fmt.Sprintf("Bearer worker-access-%d", requests) {
+			t.Errorf("request %d authorization = %q", requests, request.Header.Get("Authorization"))
+		}
+		if request.URL.Path == gateway.TaskReceivePath {
+			_ = json.NewEncoder(response).Encode(gateway.WorkDelivery{LeaseID: "lease-1", LeaseToken: 1})
+			return
+		}
+		response.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	var issued int
+	transport, err := NewHTTPTransportWithTokenSource(server.URL, server.Client(), token.SourceFunc(func(context.Context) (string, error) {
+		issued++
+		return fmt.Sprintf("worker-access-%d", issued), nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := transport.Receive(context.Background(), gateway.ReceiveWorkRequest{WorkerID: "worker-a", LeaseDurationMS: 1000}); err != nil {
+		t.Fatal(err)
+	}
+	if err := transport.Heartbeat(context.Background(), gateway.TaskHeartbeat{LeaseID: "lease-1", LeaseToken: 1, LeaseDurationMS: 1000}); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 2 || issued != 2 {
+		t.Fatalf("requests=%d issued tokens=%d, want 2 each", requests, issued)
 	}
 }

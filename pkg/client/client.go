@@ -12,6 +12,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/zephyr-workflow/zephyr/pkg/token"
 )
 
 const (
@@ -23,10 +25,11 @@ const (
 var ErrEndpointRequired = errors.New("Zephyr endpoint is required")
 
 type Config struct {
-	Endpoint   string
-	Token      string
-	Timeout    time.Duration
-	HTTPClient *http.Client
+	Endpoint    string
+	Token       string
+	TokenSource token.Source
+	Timeout     time.Duration
+	HTTPClient  *http.Client
 }
 
 type WorkflowRun struct {
@@ -36,9 +39,10 @@ type WorkflowRun struct {
 }
 
 type Client struct {
-	endpoint   string
-	token      string
-	httpClient *http.Client
+	endpoint    string
+	token       string
+	tokenSource token.Source
+	httpClient  *http.Client
 }
 
 type APIError struct {
@@ -88,7 +92,10 @@ func New(config Config) (*Client, error) {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: config.Timeout}
 	}
-	return &Client{endpoint: endpoint, token: config.Token, httpClient: httpClient}, nil
+	if config.Token != "" && config.TokenSource != nil {
+		return nil, fmt.Errorf("configure either a static token or a token source, not both")
+	}
+	return &Client{endpoint: endpoint, token: config.Token, tokenSource: config.TokenSource, httpClient: httpClient}, nil
 }
 
 func (client *Client) StartWorkflow(ctx context.Context, name string, version int, workflowContext any) (WorkflowRun, error) {
@@ -124,8 +131,8 @@ func (client *Client) startWorkflow(ctx context.Context, name string, version in
 	if idempotencyKey != "" {
 		request.Header.Set("Idempotency-Key", idempotencyKey)
 	}
-	if client.token != "" {
-		request.Header.Set("Authorization", "Bearer "+client.token)
+	if err := client.authorize(request); err != nil {
+		return WorkflowRun{}, err
 	}
 	response, err := client.httpClient.Do(request)
 	if err != nil {
@@ -160,8 +167,8 @@ func (client *Client) GetWorkflowRun(ctx context.Context, workflowID string) (Wo
 	if err != nil {
 		return WorkflowRun{}, fmt.Errorf("create workflow result request: %w", err)
 	}
-	if client.token != "" {
-		request.Header.Set("Authorization", "Bearer "+client.token)
+	if err := client.authorize(request); err != nil {
+		return WorkflowRun{}, err
 	}
 	response, err := client.httpClient.Do(request)
 	if err != nil {
@@ -179,6 +186,24 @@ func (client *Client) GetWorkflowRun(ctx context.Context, workflowID string) (Wo
 		return WorkflowRun{}, fmt.Errorf("decode workflow run: workflow ID is missing")
 	}
 	return run, nil
+}
+
+func (client *Client) authorize(request *http.Request) error {
+	token := client.token
+	if client.tokenSource != nil {
+		var err error
+		token, err = client.tokenSource.Token(request.Context())
+		if err != nil {
+			return fmt.Errorf("get Zephyr API access token: %w", err)
+		}
+		if strings.TrimSpace(token) == "" {
+			return fmt.Errorf("Zephyr API token source returned an empty token")
+		}
+	}
+	if token != "" {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
+	return nil
 }
 
 func (client *Client) WaitWorkflow(ctx context.Context, workflowID string, pollInterval time.Duration) (WorkflowRun, error) {

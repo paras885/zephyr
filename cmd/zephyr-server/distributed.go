@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -16,6 +18,7 @@ import (
 	"github.com/zephyr-workflow/zephyr/pkg/decider"
 	"github.com/zephyr-workflow/zephyr/pkg/domain"
 	"github.com/zephyr-workflow/zephyr/pkg/gateway"
+	"github.com/zephyr-workflow/zephyr/pkg/identity"
 	"github.com/zephyr-workflow/zephyr/pkg/lease"
 	"github.com/zephyr-workflow/zephyr/pkg/portal"
 	"github.com/zephyr-workflow/zephyr/pkg/queue"
@@ -24,13 +27,23 @@ import (
 )
 
 type distributedConfig struct {
-	Address           string
-	PostgresURL       string
-	AMQPURL           string
-	TaskQueue         string
-	CompletionQueue   string
-	WorkflowDirectory string
-	Token             string
+	Address               string
+	PostgresURL           string
+	AMQPURL               string
+	TaskQueue             string
+	CompletionQueue       string
+	WorkflowDirectory     string
+	Token                 string
+	Environment           string
+	DevelopmentStaticAuth bool
+	OIDCIssuerURL         string
+	OIDCClientID          string
+	OIDCClientSecret      string
+	OIDCAudience          string
+	OIDCRedirectURL       string
+	OIDCCookieHashKey     string
+	OIDCCookieBlockKey    string
+	OIDCScopes            []string
 }
 
 func runDistributed(config distributedConfig) error {
@@ -59,6 +72,9 @@ func serveDistributed(ctx context.Context, config distributedConfig) error {
 	}
 	if config.Address == "" || config.TaskQueue == "" || config.CompletionQueue == "" {
 		return fmt.Errorf("distributed mode requires an address and queue names")
+	}
+	if err := validateDistributedAuthConfig(config); err != nil {
+		return err
 	}
 	definitions, err := loadDefinitions(config.WorkflowDirectory)
 	if err != nil {
@@ -110,20 +126,45 @@ func serveDistributed(ctx context.Context, config distributedConfig) error {
 		}
 	}
 
-	var apiHandler http.Handler = api.Handler()
-	if config.Token != "" {
+	var portalHandler http.Handler
+	var portalErr error
+	if config.DevelopmentStaticAuth {
+		if config.Environment != "development" || config.Token == "" {
+			return fmt.Errorf("static bearer authentication is allowed only with ZEPHYR_ENV=development and a non-empty ZEPHYR_SERVER_TOKEN")
+		}
 		authenticator, err := auth.NewStaticTokenAuthenticator(config.Token)
 		if err != nil {
 			return err
 		}
-		apiHandler, err = api.HandlerWithAuth(authenticator)
+		apiHandler, err := api.HandlerWithAuth(authenticator)
 		if err != nil {
 			return err
 		}
+		portalHandler, portalErr = portal.New(apiHandler)
+	} else {
+		hashKey, err := decodeOIDCCookieKey(config.OIDCCookieHashKey, "OIDC_COOKIE_HASH_KEY")
+		if err != nil {
+			return err
+		}
+		blockKey, err := decodeOIDCCookieKey(config.OIDCCookieBlockKey, "OIDC_COOKIE_BLOCK_KEY")
+		if err != nil {
+			return err
+		}
+		oidcClient, err := identity.NewOIDCClient(ctx, identity.OIDCConfig{
+			IssuerURL: config.OIDCIssuerURL, ClientID: config.OIDCClientID,
+			ClientSecret: config.OIDCClientSecret,
+			Audience:     config.OIDCAudience, RedirectURL: config.OIDCRedirectURL,
+			Scopes: config.OIDCScopes,
+		})
+		if err != nil {
+			return err
+		}
+		portalHandler, portalErr = portal.NewOIDC(api.Handler(), portal.OIDCOptions{
+			Client: oidcClient, CookieHashKey: hashKey, CookieBlockKey: blockKey, SecureCookies: true,
+		})
 	}
-	portalHandler, err := portal.New(apiHandler)
-	if err != nil {
-		return err
+	if portalErr != nil {
+		return portalErr
 	}
 	var ready atomic.Bool
 	dependencyReady := func(requestContext context.Context) error {
@@ -206,6 +247,54 @@ func serveDistributed(ctx context.Context, config distributedConfig) error {
 		}
 		return err
 	}
+}
+
+func decodeOIDCCookieKey(encoded, name string) ([]byte, error) {
+	if encoded == "" {
+		return nil, fmt.Errorf("%s is required for OIDC sessions", name)
+	}
+	key, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil || len(key) != 32 {
+		return nil, fmt.Errorf("%s must be base64-encoded 32-byte key material", name)
+	}
+	return key, nil
+}
+
+func validateDistributedAuthConfig(config distributedConfig) error {
+	if config.DevelopmentStaticAuth {
+		if config.Environment != "development" || config.Token == "" {
+			return fmt.Errorf("static bearer authentication is allowed only with ZEPHYR_ENV=development and a non-empty ZEPHYR_SERVER_TOKEN")
+		}
+		_, err := auth.NewStaticTokenAuthenticator(config.Token)
+		return err
+	}
+	if config.Token != "" {
+		return fmt.Errorf("ZEPHYR_SERVER_TOKEN is only accepted with ZEPHYR_DEV_STATIC_AUTH=true and ZEPHYR_ENV=development")
+	}
+	for _, required := range []struct{ name, value string }{
+		{"OIDC_ISSUER_URL", config.OIDCIssuerURL},
+		{"OIDC_CLIENT_ID", config.OIDCClientID},
+		{"OIDC_API_AUDIENCE", config.OIDCAudience},
+		{"OIDC_REDIRECT_URL", config.OIDCRedirectURL},
+	} {
+		if strings.TrimSpace(required.value) == "" {
+			return fmt.Errorf("%s is required for distributed OIDC authentication", required.name)
+		}
+	}
+	if _, err := decodeOIDCCookieKey(config.OIDCCookieHashKey, "OIDC_COOKIE_HASH_KEY"); err != nil {
+		return err
+	}
+	if _, err := decodeOIDCCookieKey(config.OIDCCookieBlockKey, "OIDC_COOKIE_BLOCK_KEY"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func oidcScopesFromEnv(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return []string{"zephyr:workflow:read", "zephyr:workflow:start"}
+	}
+	return strings.Fields(value)
 }
 
 func withHealthRoutes(next http.Handler, readiness func(context.Context) error) http.Handler {
