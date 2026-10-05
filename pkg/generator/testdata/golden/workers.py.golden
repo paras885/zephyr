@@ -1,0 +1,5 @@
+from typing import Protocol
+
+class ChargePaymentWorker(Protocol):
+    async def ChargePayment(self, input: Input) -> Output: ...
+

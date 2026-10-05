@@ -1,0 +1,4 @@
+type Input { order_id: string }
+type Output { status: string }
+task ChargePayment(input: Input) -> Output { timeout 30s }
+workflow Checkout(input: Input) -> Output { step charge = ChargePayment({}); return Output { status: "charged" }; }

@@ -1,0 +1,7 @@
+package generated
+
+import "context"
+
+type ChargePaymentWorker interface {
+	ChargePayment(ctx context.Context, input Input) (output Output, err error)
+}

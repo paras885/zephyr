@@ -1,0 +1,14 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "go": true,
+        "test": true,
+        "printf": true,
+        "gofmt": true,
+        "/^docker compose -f deploy/compose\\.yaml config -q && ruby -e 'require \"yaml\"; ARGV\\.each \\{ \\|path\\| YAML\\.load_stream\\(File\\.read\\(path\\)\\); puts \"parsed #\\{path\\}\" \\}' deploy/compose\\.yaml deploy/kubernetes/zephyr-migrate\\.yaml deploy/kubernetes/zephyr-server\\.yaml$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "docker build": true,
+        "kubectl apply": true
+    }
+}

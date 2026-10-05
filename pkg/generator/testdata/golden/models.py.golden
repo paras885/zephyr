@@ -1,0 +1,8 @@
+from pydantic import BaseModel
+
+class Input(BaseModel):
+    order_id: str
+
+class Output(BaseModel):
+    status: str
+

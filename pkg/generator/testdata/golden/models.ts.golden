@@ -1,0 +1,12 @@
+export interface Input {
+  order_id: string;
+}
+
+export interface Output {
+  status: string;
+}
+
+export interface ChargePaymentWorker {
+  ChargePayment(input: Input): Promise<Output>;
+}
+

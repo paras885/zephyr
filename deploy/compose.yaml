@@ -1,0 +1,70 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: zephyr
+      POSTGRES_USER: zephyr
+      POSTGRES_PASSWORD: zephyr-local-only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zephyr -d zephyr"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  rabbitmq:
+    image: rabbitmq:4.1-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: zephyr
+      RABBITMQ_DEFAULT_PASS: zephyr-local-only
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+
+  migrate:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command: ["-migrate-only"]
+    environment:
+      DATABASE_URL: postgres://zephyr:zephyr-local-only@postgres:5432/zephyr?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  server:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgres://zephyr:zephyr-local-only@postgres:5432/zephyr?sslmode=disable
+      AMQP_URL: amqp://zephyr:zephyr-local-only@rabbitmq:5672/
+      ZEPHYR_HTTP_ADDR: 0.0.0.0:8080
+      ZEPHYR_WORKFLOWS_DIR: /app/workflows
+      ZEPHYR_SERVER_TOKEN: ${ZEPHYR_SERVER_TOKEN:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8080/readyz >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  rabbitmq-data:

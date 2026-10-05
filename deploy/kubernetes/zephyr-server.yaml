@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zephyr-server
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: zephyr-server
+  template:
+    metadata:
+      labels:
+        app: zephyr-server
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: zephyr-server
+          image: zephyr:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: zephyr-runtime
+                  key: DATABASE_URL
+            - name: AMQP_URL
+              valueFrom:
+                secretKeyRef:
+                  name: zephyr-runtime
+                  key: AMQP_URL
+            - name: ZEPHYR_SERVER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: zephyr-runtime
+                  key: ZEPHYR_SERVER_TOKEN
+                  optional: true
+            - name: ZEPHYR_HTTP_ADDR
+              value: 0.0.0.0:8080
+            - name: ZEPHYR_WORKFLOWS_DIR
+              value: /app/workflows
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zephyr-server
+spec:
+  type: ClusterIP
+  selector:
+    app: zephyr-server
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP

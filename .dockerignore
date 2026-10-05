@@ -1,0 +1,11 @@
+.git
+.gitignore
+.DS_Store
+zephyr-gen
+zephyr.db
+zephyr.db-*
+*.db
+*.db-*
+test/
+**/*_test.go
+deploy/

@@ -1,0 +1,9 @@
+package generated
+
+type Input struct {
+	OrderId string `json:"order_id"`
+}
+
+type Output struct {
+	Status string `json:"status"`
+}

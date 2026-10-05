@@ -1,0 +1,12 @@
+zephyr.db
+zephyr.db-shm
+zephyr.db-wal
+
+# Build artifacts
+zephyr-gen
+/bin/
+/dist/
+
+# Editor / OS
+.DS_Store
+

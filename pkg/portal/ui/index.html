@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Zephyr | Workflow Operations</title>
+  <link rel="stylesheet" href="/portal.css">
+  <script src="/portal.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="/" aria-label="Zephyr home">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span>zephyr<span class="brand-period">.</span></span>
+      </a>
+      <div class="workspace-label">WORKSPACE</div>
+      <div class="workspace-switch"><span class="workspace-dot"></span><span id="workspace-name">Local engine</span><span class="chevron">⌄</span></div>
+      <nav class="primary-nav" aria-label="Primary navigation">
+        <button class="nav-link active" data-view="overview"><span class="nav-icon">◫</span><span>Overview</span><span class="nav-count" id="nav-run-count">0</span></button>
+        <button class="nav-link" data-view="workflows"><span class="nav-icon">⌘</span><span>Workflows</span></button>
+      </nav>
+      <div class="sidebar-bottom">
+        <div class="connection-card"><span class="connection-led"></span><span><strong>Engine connected</strong><small id="connection-endpoint">checking API</small></span></div>
+        <div class="sidebar-foot">ZEPHYR CONTROL PLANE <span>v0.1</span></div>
+      </div>
+    </aside>
+
+    <main class="main-area">
+      <header class="topbar">
+        <div class="breadcrumbs"><span>Operations</span><span class="crumb-slash">/</span><strong id="breadcrumb-current">Overview</strong></div>
+        <div class="topbar-actions">
+          <label class="token-field"><span>API TOKEN</span><input id="api-token" type="password" autocomplete="off" placeholder="Optional" aria-label="Optional API token"></label>
+          <button class="button button-quiet" id="refresh-button" type="button"><span class="refresh-glyph">↻</span> Refresh</button>
+          <button class="button button-primary" id="start-button" type="button"><span>＋</span> Start workflow</button>
+        </div>
+      </header>
+
+      <section class="page-heading">
+        <div>
+          <div class="eyebrow"><span class="live-dot"></span> LIVE EXECUTION MONITOR</div>
+          <h1 id="page-title">Workflow operations</h1>
+          <p id="page-subtitle">A clear view of what is defined, running, and finished.</p>
+        </div>
+        <div class="updated-label"><span class="updated-indicator"></span><span id="updated-at">Connecting…</span></div>
+      </section>
+
+      <section class="metrics" aria-label="Execution summary">
+        <article class="metric metric-total"><div class="metric-label">TOTAL RUNS</div><div class="metric-value" id="metric-total">—</div><div class="metric-note">All workflow executions</div><span class="metric-mark">01</span></article>
+        <article class="metric metric-running"><div class="metric-label">IN PROGRESS</div><div class="metric-value" id="metric-running">—</div><div class="metric-note"><span class="tiny-live-dot"></span> Active or waiting on work</div><span class="metric-mark">02</span></article>
+        <article class="metric metric-completed"><div class="metric-label">COMPLETED</div><div class="metric-value" id="metric-completed">—</div><div class="metric-note">Successfully finished</div><span class="metric-mark">03</span></article>
+        <article class="metric metric-failed"><div class="metric-label">FAILED</div><div class="metric-value" id="metric-failed">—</div><div class="metric-note">Needs attention</div><span class="metric-mark">04</span></article>
+      </section>
+
+      <div class="content-grid">
+        <div class="content-column">
+          <section class="panel workflow-panel" id="workflow-section">
+            <div class="panel-heading">
+              <div><div class="section-kicker">CATALOG</div><h2>Workflows <span class="heading-count" id="workflow-count">0</span></h2></div>
+              <div class="panel-tools"><span class="panel-caption">Registered definitions</span><button class="text-button" id="clear-workflow-filter" type="button" hidden>Clear filter</button></div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>WORKFLOW</th><th>VERSION</th><th>STEPS</th><th></th></tr></thead>
+                <tbody id="workflow-rows"><tr><td colspan="4" class="table-empty">Loading workflows…</td></tr></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="panel runs-panel" id="runs-section">
+            <div class="panel-heading runs-heading">
+              <div><div class="section-kicker">EXECUTIONS</div><h2>Recent runs <span class="heading-count" id="run-count">0</span></h2></div>
+              <div class="run-controls">
+                <label class="search-box"><span aria-hidden="true">⌕</span><input id="run-search" type="search" placeholder="Find a run" aria-label="Search runs"></label>
+                <select id="status-filter" aria-label="Filter runs by status"><option value="">All statuses</option><option value="RUNNING">In progress</option><option value="COMPLETED">Completed</option><option value="FAILED">Failed</option><option value="COMPENSATING">Compensating</option></select>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table class="run-table">
+                <thead><tr><th>RUN</th><th>WORKFLOW</th><th>STATUS</th><th>TASKS</th><th>LAST UPDATED</th></tr></thead>
+                <tbody id="run-rows"><tr><td colspan="5" class="table-empty">Loading runs…</td></tr></tbody>
+              </table>
+            </div>
+            <div class="pagination"><span id="run-pagination-label">Showing 0 runs</span><div><button class="page-button" id="previous-page" type="button" aria-label="Previous page" disabled>←</button><button class="page-button" id="next-page" type="button" aria-label="Next page" disabled>→</button></div></div>
+          </section>
+        </div>
+
+        <aside class="panel detail-panel" id="detail-panel" aria-live="polite">
+          <div class="detail-placeholder" id="detail-placeholder">
+            <div class="placeholder-art" aria-hidden="true"><span></span><span></span><span></span><b></b></div>
+            <div class="section-kicker">RUN INSPECTOR</div>
+            <h2>Select a run</h2>
+            <p>Execution state, task outcomes, and event history will appear here.</p>
+          </div>
+          <div id="run-detail" hidden></div>
+        </aside>
+      </div>
+      <div class="toast" id="toast" role="status" hidden></div>
+    </main>
+  </div>
+
+  <dialog id="start-dialog" class="start-dialog">
+    <form method="dialog" class="dialog-close-row"><button class="close-button" aria-label="Close dialog">×</button></form>
+    <div class="section-kicker">NEW EXECUTION</div>
+    <h2>Start a workflow</h2>
+    <p class="dialog-intro">Choose a registered definition and provide its input context.</p>
+    <form id="start-form">
+      <label class="form-label" for="workflow-select">Workflow</label>
+      <select id="workflow-select" required></select>
+      <label class="form-label" for="version-select">Definition version</label>
+      <select id="version-select" required></select>
+      <label class="form-label" for="workflow-context">Input context <span>JSON</span></label>
+      <textarea id="workflow-context" rows="8" spellcheck="false">{}</textarea>
+      <div class="form-error" id="form-error" hidden></div>
+      <div class="dialog-actions"><button class="button button-quiet" id="cancel-start" type="button">Cancel</button><button class="button button-primary" id="confirm-start" type="submit">Start execution <span>→</span></button></div>
+    </form>
+  </dialog>
+</body>
+</html>
