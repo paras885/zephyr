@@ -12,7 +12,6 @@ import (
 	"syscall"
 	"time"
 
-	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/zephyr-workflow/zephyr/pkg/auth"
 	"github.com/zephyr-workflow/zephyr/pkg/decider"
 	"github.com/zephyr-workflow/zephyr/pkg/domain"
@@ -73,28 +72,18 @@ func serveDistributed(ctx context.Context, config distributedConfig) error {
 	if err := executions.Ping(ctx); err != nil {
 		return fmt.Errorf("verify PostgreSQL readiness: %w", err)
 	}
-	connection, err := amqp.Dial(config.AMQPURL)
+	manager, err := queue.NewRabbitMQManager(ctx, config.AMQPURL)
 	if err != nil {
-		return fmt.Errorf("connect to RabbitMQ: %w", err)
+		return fmt.Errorf("start RabbitMQ manager: %w", err)
 	}
-	defer connection.Close()
-	workChannel, err := connection.Channel()
+	defer manager.Close()
+	workQueue, err := queue.NewManagedRabbitMQQueue(manager, config.TaskQueue)
 	if err != nil {
-		return fmt.Errorf("open RabbitMQ work channel: %w", err)
-	}
-	workQueue, err := queue.NewRabbitMQQueue(workChannel, config.TaskQueue)
-	if err != nil {
-		_ = workChannel.Close()
 		return err
 	}
 	defer workQueue.Close()
-	completionChannel, err := connection.Channel()
+	completionQueue, err := queue.NewManagedRabbitMQCompletionQueue(manager, config.CompletionQueue)
 	if err != nil {
-		return fmt.Errorf("open RabbitMQ completion channel: %w", err)
-	}
-	completionQueue, err := queue.NewRabbitMQCompletionQueue(completionChannel, config.CompletionQueue)
-	if err != nil {
-		_ = completionChannel.Close()
 		return err
 	}
 	defer completionQueue.Close()
@@ -144,8 +133,8 @@ func serveDistributed(ctx context.Context, config distributedConfig) error {
 		if err := executions.Ping(requestContext); err != nil {
 			return fmt.Errorf("PostgreSQL unavailable: %w", err)
 		}
-		if connection.IsClosed() {
-			return fmt.Errorf("RabbitMQ connection is closed")
+		if !manager.Ready() {
+			return fmt.Errorf("RabbitMQ connection, channels, or consumers are unavailable")
 		}
 		return nil
 	}
@@ -153,20 +142,34 @@ func serveDistributed(ctx context.Context, config distributedConfig) error {
 	server := &http.Server{Addr: config.Address, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 	workerContext, cancelWorkers := context.WithCancel(ctx)
 	var workers sync.WaitGroup
-	workerErrors := make(chan error, 4)
 	startWorker := func(name string, run func(context.Context) error) {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			err := run(workerContext)
-			if workerContext.Err() != nil {
-				return
+			backoff := 100 * time.Millisecond
+			for workerContext.Err() == nil {
+				err := run(workerContext)
+				if workerContext.Err() != nil {
+					return
+				}
+				if err == nil {
+					err = fmt.Errorf("stopped unexpectedly")
+				}
+				log.Printf("%s stopped; restarting: %v", name, err)
+				timer := time.NewTimer(backoff)
+				select {
+				case <-workerContext.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+				if backoff < 5*time.Second {
+					backoff *= 2
+					if backoff > 5*time.Second {
+						backoff = 5 * time.Second
+					}
+				}
 			}
-			if err == nil {
-				err = fmt.Errorf("%s stopped unexpectedly", name)
-			}
-			ready.Store(false)
-			workerErrors <- fmt.Errorf("%s: %w", name, err)
 		}()
 	}
 	startWorker("task publication dispatcher", api.RunTaskPublicationDispatcher)
@@ -201,11 +204,6 @@ func serveDistributed(ctx context.Context, config distributedConfig) error {
 		if err == http.ErrServerClosed {
 			return nil
 		}
-		return err
-	case err := <-workerErrors:
-		shutdownContext, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		_ = server.Shutdown(shutdownContext)
 		return err
 	}
 }

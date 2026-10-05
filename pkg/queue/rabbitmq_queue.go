@@ -24,6 +24,7 @@ type rabbitActiveItem struct {
 
 type RabbitMQQueue struct {
 	channel       *amqp.Channel
+	session       *rabbitSession
 	name          string
 	confirmations <-chan amqp.Confirmation
 	publishMu     sync.Mutex
@@ -32,6 +33,7 @@ type RabbitMQQueue struct {
 	inFlight      map[string]rabbitQueueDelivery
 	activeIDs     map[string]rabbitActiveItem
 	completed     completedWorkIDs
+	generation    uint64
 }
 
 func NewRabbitMQQueue(channel *amqp.Channel, name string) (*RabbitMQQueue, error) {
@@ -41,8 +43,11 @@ func NewRabbitMQQueue(channel *amqp.Channel, name string) (*RabbitMQQueue, error
 	if name == "" {
 		return nil, fmt.Errorf("queue name is required")
 	}
-	if _, err := channel.QueueDeclare(name, true, false, false, false, nil); err != nil {
-		return nil, fmt.Errorf("declare RabbitMQ queue: %w", err)
+	if err := declareRabbitTopology(channel, name); err != nil {
+		return nil, fmt.Errorf("declare RabbitMQ queue topology: %w", err)
+	}
+	if err := channel.Qos(rabbitPrefetch, 0, false); err != nil {
+		return nil, fmt.Errorf("set RabbitMQ prefetch: %w", err)
 	}
 	if err := channel.Confirm(false); err != nil {
 		return nil, fmt.Errorf("enable RabbitMQ publisher confirms: %w", err)
@@ -55,6 +60,23 @@ func NewRabbitMQQueue(channel *amqp.Channel, name string) (*RabbitMQQueue, error
 		inFlight:      make(map[string]rabbitQueueDelivery),
 		activeIDs:     make(map[string]rabbitActiveItem),
 		completed:     newCompletedWorkIDs(completedWorkIDLimit),
+	}, nil
+}
+
+func NewManagedRabbitMQQueue(manager *RabbitMQManager, name string) (*RabbitMQQueue, error) {
+	if manager == nil {
+		return nil, fmt.Errorf("RabbitMQ manager is required")
+	}
+	if name == "" {
+		return nil, fmt.Errorf("queue name is required")
+	}
+	return &RabbitMQQueue{
+		session:   newRabbitSession(manager, name, false),
+		name:      name,
+		consumers: make(map[string]<-chan amqp.Delivery),
+		inFlight:  make(map[string]rabbitQueueDelivery),
+		activeIDs: make(map[string]rabbitActiveItem),
+		completed: newCompletedWorkIDs(completedWorkIDLimit),
 	}, nil
 }
 
@@ -76,30 +98,40 @@ func (queue *RabbitMQQueue) Publish(ctx context.Context, item WorkItem) error {
 	queue.activeIDs[item.ID] = rabbitActiveItem{}
 	queue.mu.Unlock()
 
-	if err := queue.channel.PublishWithContext(ctx, "", queue.name, false, false, amqp.Publishing{
+	publishing := amqp.Publishing{
 		ContentType:  "application/json",
 		DeliveryMode: amqp.Persistent,
 		MessageId:    item.ID,
 		Body:         body,
-	}); err != nil {
+	}
+	if queue.session != nil {
+		err = queue.session.publish(ctx, "", queue.name, publishing)
+	} else {
+		err = queue.publishLegacy(ctx, publishing)
+	}
+	if err != nil {
 		queue.releasePublishReservation(item.ID)
 		return fmt.Errorf("publish work item: %w", err)
+	}
+	return nil
+}
+
+func (queue *RabbitMQQueue) publishLegacy(ctx context.Context, publishing amqp.Publishing) error {
+	if err := queue.channel.PublishWithContext(ctx, "", queue.name, false, false, publishing); err != nil {
+		return err
 	}
 	select {
 	case confirmation, open := <-queue.confirmations:
 		if !open {
-			queue.releasePublishReservation(item.ID)
 			return ErrClosed
 		}
 		if !confirmation.Ack {
-			queue.releasePublishReservation(item.ID)
-			return fmt.Errorf("RabbitMQ negatively acknowledged work item %q", item.ID)
+			return fmt.Errorf("RabbitMQ negatively acknowledged work item %q", publishing.MessageId)
 		}
+		return nil
 	case <-ctx.Done():
-		queue.releasePublishReservation(item.ID)
 		return ctx.Err()
 	}
-	return nil
 }
 
 func (queue *RabbitMQQueue) releasePublishReservation(itemID string) {
@@ -114,6 +146,9 @@ func (queue *RabbitMQQueue) Receive(ctx context.Context, workerID string) (Deliv
 	if workerID == "" {
 		return Delivery{}, fmt.Errorf("worker ID is required")
 	}
+	if queue.session != nil {
+		return queue.receiveManaged(ctx, workerID)
+	}
 	consumer, err := queue.consumer(workerID)
 	if err != nil {
 		return Delivery{}, err
@@ -126,7 +161,7 @@ func (queue *RabbitMQQueue) Receive(ctx context.Context, workerID string) (Deliv
 			}
 			var item WorkItem
 			if err := json.Unmarshal(message.Body, &item); err != nil {
-				_ = message.Reject(false)
+				_ = message.Reject(true)
 				return Delivery{}, fmt.Errorf("unmarshal work item: %w", err)
 			}
 			deliveryID := rabbitDeliveryID(workerID, message.DeliveryTag)
@@ -215,7 +250,74 @@ func (queue *RabbitMQQueue) finish(ctx context.Context, deliveryID string, rejec
 }
 
 func (queue *RabbitMQQueue) Close() error {
+	if queue.session != nil {
+		queue.session.close()
+		return nil
+	}
 	return queue.channel.Close()
+}
+
+func (queue *RabbitMQQueue) receiveManaged(ctx context.Context, workerID string) (Delivery, error) {
+	for {
+		consumer, generation, err := queue.session.consumer(ctx, workerID)
+		if err != nil {
+			return Delivery{}, err
+		}
+		queue.syncGeneration(generation)
+		_, _, changed, _ := queue.session.state()
+		select {
+		case message, open := <-consumer:
+			if !open {
+				if err := queue.session.waitForGeneration(ctx, generation); err != nil {
+					return Delivery{}, err
+				}
+				continue
+			}
+			var item WorkItem
+			if err := json.Unmarshal(message.Body, &item); err != nil {
+				_ = message.Reject(true)
+				return Delivery{}, fmt.Errorf("unmarshal work item: %w", err)
+			}
+			deliveryID := rabbitDeliveryID(workerID, message.DeliveryTag)
+			queue.mu.Lock()
+			if item.ID != "" {
+				if queue.completed.contains(item.ID) {
+					queue.mu.Unlock()
+					if err := message.Ack(false); err != nil {
+						return Delivery{}, fmt.Errorf("ack completed RabbitMQ duplicate: %w", err)
+					}
+					continue
+				}
+				active, exists := queue.activeIDs[item.ID]
+				if exists && active.deliveryID != "" && !(active.requeuePending && message.Redelivered) {
+					queue.mu.Unlock()
+					if err := message.Ack(false); err != nil {
+						return Delivery{}, fmt.Errorf("ack duplicate RabbitMQ delivery: %w", err)
+					}
+					continue
+				}
+				queue.activeIDs[item.ID] = rabbitActiveItem{deliveryID: deliveryID}
+			}
+			queue.inFlight[deliveryID] = rabbitQueueDelivery{message: message, itemID: item.ID}
+			queue.mu.Unlock()
+			return Delivery{ID: deliveryID, Item: item}, nil
+		case <-changed:
+		case <-ctx.Done():
+			return Delivery{}, ctx.Err()
+		case <-queue.session.ctx.Done():
+			return Delivery{}, ErrClosed
+		}
+	}
+}
+
+func (queue *RabbitMQQueue) syncGeneration(generation uint64) {
+	queue.mu.Lock()
+	if queue.generation != generation {
+		queue.generation = generation
+		queue.inFlight = make(map[string]rabbitQueueDelivery)
+		queue.activeIDs = make(map[string]rabbitActiveItem)
+	}
+	queue.mu.Unlock()
 }
 
 func (queue *RabbitMQQueue) consumer(workerID string) (<-chan amqp.Delivery, error) {

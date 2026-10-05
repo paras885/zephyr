@@ -2,8 +2,9 @@ package worker
 
 import (
 	"context"
-	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 
 	"github.com/zephyr-workflow/zephyr/pkg/gateway"
@@ -39,10 +40,7 @@ func (transport *RabbitMQTransport) Heartbeat(ctx context.Context, heartbeat gat
 }
 
 func (transport *RabbitMQTransport) Complete(ctx context.Context, completion gateway.TaskCompletion) error {
-	messageID, err := newCompletionMessageID()
-	if err != nil {
-		return err
-	}
+	messageID := completionMessageID(queue.CompletionSucceeded, completion.WorkflowID, completion.TaskID, completion.NodeID, completion.LeaseID, completion.LeaseToken)
 	return transport.completions.PublishCompletion(ctx, queue.CompletionMessage{
 		MessageID:  messageID,
 		Kind:       queue.CompletionSucceeded,
@@ -56,10 +54,7 @@ func (transport *RabbitMQTransport) Complete(ctx context.Context, completion gat
 }
 
 func (transport *RabbitMQTransport) Fail(ctx context.Context, failure gateway.TaskFailure) error {
-	messageID, err := newCompletionMessageID()
-	if err != nil {
-		return err
-	}
+	messageID := completionMessageID(queue.CompletionFailed, failure.WorkflowID, failure.TaskID, failure.NodeID, failure.LeaseID, failure.LeaseToken)
 	return transport.completions.PublishCompletion(ctx, queue.CompletionMessage{
 		MessageID:  messageID,
 		Kind:       queue.CompletionFailed,
@@ -72,10 +67,15 @@ func (transport *RabbitMQTransport) Fail(ctx context.Context, failure gateway.Ta
 	})
 }
 
-func newCompletionMessageID() (string, error) {
-	var random [16]byte
-	if _, err := rand.Read(random[:]); err != nil {
-		return "", fmt.Errorf("generate completion message ID: %w", err)
-	}
-	return "completion-" + hex.EncodeToString(random[:]), nil
+func completionMessageID(kind, workflowID, taskID, nodeID, leaseID string, leaseToken uint64) string {
+	identity, _ := json.Marshal(struct {
+		Kind       string `json:"kind"`
+		WorkflowID string `json:"workflow_id"`
+		TaskID     string `json:"task_id"`
+		NodeID     string `json:"node_id"`
+		LeaseID    string `json:"lease_id"`
+		LeaseToken uint64 `json:"lease_token"`
+	}{kind, workflowID, taskID, nodeID, leaseID, leaseToken})
+	digest := sha256.Sum256(identity)
+	return "completion-" + hex.EncodeToString(digest[:])
 }

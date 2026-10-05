@@ -11,12 +11,14 @@ import (
 
 type RabbitMQCompletionQueue struct {
 	channel       *amqp.Channel
+	session       *rabbitSession
 	name          string
 	confirmations <-chan amqp.Confirmation
 	publishMu     sync.Mutex
 	mu            sync.Mutex
 	consumers     map[string]<-chan amqp.Delivery
 	inFlight      map[string]amqp.Delivery
+	generation    uint64
 }
 
 func NewRabbitMQCompletionQueue(channel *amqp.Channel, name string) (*RabbitMQCompletionQueue, error) {
@@ -26,8 +28,11 @@ func NewRabbitMQCompletionQueue(channel *amqp.Channel, name string) (*RabbitMQCo
 	if name == "" {
 		return nil, fmt.Errorf("completion queue name is required")
 	}
-	if _, err := channel.QueueDeclare(name, true, false, false, false, nil); err != nil {
-		return nil, fmt.Errorf("declare RabbitMQ completion queue: %w", err)
+	if err := declareRabbitTopology(channel, name); err != nil {
+		return nil, fmt.Errorf("declare RabbitMQ completion topology: %w", err)
+	}
+	if err := channel.Qos(rabbitPrefetch, 0, false); err != nil {
+		return nil, fmt.Errorf("set RabbitMQ completion prefetch: %w", err)
 	}
 	if err := channel.Confirm(false); err != nil {
 		return nil, fmt.Errorf("enable RabbitMQ publisher confirms: %w", err)
@@ -41,6 +46,21 @@ func NewRabbitMQCompletionQueue(channel *amqp.Channel, name string) (*RabbitMQCo
 	}, nil
 }
 
+func NewManagedRabbitMQCompletionQueue(manager *RabbitMQManager, name string) (*RabbitMQCompletionQueue, error) {
+	if manager == nil {
+		return nil, fmt.Errorf("RabbitMQ manager is required")
+	}
+	if name == "" {
+		return nil, fmt.Errorf("completion queue name is required")
+	}
+	return &RabbitMQCompletionQueue{
+		session:   newRabbitSession(manager, name, true),
+		name:      name,
+		consumers: make(map[string]<-chan amqp.Delivery),
+		inFlight:  make(map[string]amqp.Delivery),
+	}, nil
+}
+
 func (queue *RabbitMQCompletionQueue) PublishCompletion(ctx context.Context, message CompletionMessage) error {
 	if err := message.Validate(); err != nil {
 		return fmt.Errorf("validate completion message: %w", err)
@@ -51,28 +71,39 @@ func (queue *RabbitMQCompletionQueue) PublishCompletion(ctx context.Context, mes
 	if err != nil {
 		return fmt.Errorf("marshal completion message: %w", err)
 	}
-	if err := queue.channel.PublishWithContext(ctx, "", queue.name, false, false, amqp.Publishing{
+	publishing := amqp.Publishing{
 		ContentType:  "application/json",
 		DeliveryMode: amqp.Persistent,
 		MessageId:    message.MessageID,
 		Type:         message.Kind,
 		Body:         body,
-	}); err != nil {
+	}
+	if queue.session != nil {
+		return queue.session.publish(ctx, "", queue.name, publishing)
+	}
+	if err := queue.channel.PublishWithContext(ctx, "", queue.name, false, false, publishing); err != nil {
 		return fmt.Errorf("publish completion message: %w", err)
 	}
-	confirmation, open := <-queue.confirmations
-	if !open {
-		return ErrClosed
+	select {
+	case confirmation, open := <-queue.confirmations:
+		if !open {
+			return ErrClosed
+		}
+		if !confirmation.Ack {
+			return fmt.Errorf("RabbitMQ negatively acknowledged completion message %q", message.MessageID)
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	if !confirmation.Ack {
-		return fmt.Errorf("RabbitMQ negatively acknowledged completion message %q", message.MessageID)
-	}
-	return nil
 }
 
 func (queue *RabbitMQCompletionQueue) ReceiveCompletion(ctx context.Context, consumerID string) (CompletionDelivery, error) {
 	if consumerID == "" {
 		return CompletionDelivery{}, fmt.Errorf("completion consumer ID is required")
+	}
+	if queue.session != nil {
+		return queue.receiveManaged(ctx, consumerID)
 	}
 	consumer, err := queue.consumer(consumerID)
 	if err != nil {
@@ -85,15 +116,15 @@ func (queue *RabbitMQCompletionQueue) ReceiveCompletion(ctx context.Context, con
 		}
 		var completion CompletionMessage
 		if err := json.Unmarshal(message.Body, &completion); err != nil {
-			_ = message.Reject(false)
+			_ = message.Reject(true)
 			return CompletionDelivery{}, fmt.Errorf("unmarshal completion message: %w", err)
 		}
 		if err := completion.Validate(); err != nil {
-			_ = message.Reject(false)
+			_ = message.Reject(true)
 			return CompletionDelivery{}, fmt.Errorf("validate completion message: %w", err)
 		}
 		if message.MessageId != "" && message.MessageId != completion.MessageID {
-			_ = message.Reject(false)
+			_ = message.Reject(true)
 			return CompletionDelivery{}, fmt.Errorf("RabbitMQ message ID %q does not match completion message ID %q", message.MessageId, completion.MessageID)
 		}
 		deliveryID := rabbitDeliveryID(consumerID, message.DeliveryTag)
@@ -143,7 +174,63 @@ func (queue *RabbitMQCompletionQueue) finish(ctx context.Context, deliveryID str
 }
 
 func (queue *RabbitMQCompletionQueue) Close() error {
+	if queue.session != nil {
+		queue.session.close()
+		return nil
+	}
 	return queue.channel.Close()
+}
+
+func (queue *RabbitMQCompletionQueue) receiveManaged(ctx context.Context, consumerID string) (CompletionDelivery, error) {
+	for {
+		consumer, generation, err := queue.session.consumer(ctx, consumerID)
+		if err != nil {
+			return CompletionDelivery{}, err
+		}
+		queue.syncGeneration(generation)
+		_, _, changed, _ := queue.session.state()
+		select {
+		case message, open := <-consumer:
+			if !open {
+				if err := queue.session.waitForGeneration(ctx, generation); err != nil {
+					return CompletionDelivery{}, err
+				}
+				continue
+			}
+			var completion CompletionMessage
+			if err := json.Unmarshal(message.Body, &completion); err != nil {
+				_ = message.Reject(true)
+				return CompletionDelivery{}, fmt.Errorf("unmarshal completion message: %w", err)
+			}
+			if err := completion.Validate(); err != nil {
+				_ = message.Reject(true)
+				return CompletionDelivery{}, fmt.Errorf("validate completion message: %w", err)
+			}
+			if message.MessageId != "" && message.MessageId != completion.MessageID {
+				_ = message.Reject(true)
+				return CompletionDelivery{}, fmt.Errorf("RabbitMQ message ID %q does not match completion message ID %q", message.MessageId, completion.MessageID)
+			}
+			deliveryID := rabbitDeliveryID(consumerID, message.DeliveryTag)
+			queue.mu.Lock()
+			queue.inFlight[deliveryID] = message
+			queue.mu.Unlock()
+			return CompletionDelivery{ID: deliveryID, Message: completion}, nil
+		case <-changed:
+		case <-ctx.Done():
+			return CompletionDelivery{}, ctx.Err()
+		case <-queue.session.ctx.Done():
+			return CompletionDelivery{}, ErrClosed
+		}
+	}
+}
+
+func (queue *RabbitMQCompletionQueue) syncGeneration(generation uint64) {
+	queue.mu.Lock()
+	if queue.generation != generation {
+		queue.generation = generation
+		queue.inFlight = make(map[string]amqp.Delivery)
+	}
+	queue.mu.Unlock()
 }
 
 func (queue *RabbitMQCompletionQueue) consumer(consumerID string) (<-chan amqp.Delivery, error) {
