@@ -1,0 +1,51 @@
+groups:
+  - name: zephyr-availability
+    rules:
+      - alert: ZephyrTargetDown
+        expr: up{job="zephyr-server"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Zephyr server target is unavailable
+          description: Prometheus cannot scrape the Zephyr server target.
+      - alert: ZephyrDependencyUnavailable
+        expr: zephyr_dependency_ready{dependency=~"postgres|rabbitmq"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: A Zephyr runtime dependency is unavailable
+          description: Readiness has reported a PostgreSQL or RabbitMQ outage.
+      - alert: ZephyrHTTP5xxRateHigh
+        expr: sum(rate(zephyr_http_requests_total{status=~"5.."}[5m])) / clamp_min(sum(rate(zephyr_http_requests_total[5m])), 0.01) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Zephyr HTTP error rate is above 5 percent
+          description: More than 5 percent of requests failed with server errors for 10 minutes.
+      - alert: ZephyrOutboxBacklogOld
+        expr: zephyr_outbox_oldest_pending_age_seconds > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Zephyr outbox delivery is delayed
+          description: The oldest pending outbox record is more than five minutes old.
+      - alert: ZephyrExpiredLeaseBacklog
+        expr: zephyr_expired_lease_backlog > 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Expired task leases are accumulating
+          description: More than ten expired leases are awaiting recovery.
+      - alert: ZephyrRequestLatencyHigh
+        expr: histogram_quantile(0.95, sum by (le) (rate(zephyr_http_request_duration_seconds_bucket[5m]))) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Zephyr p95 HTTP latency is above 500ms
+          description: The 5-minute p95 HTTP duration exceeded 500ms for 10 minutes.

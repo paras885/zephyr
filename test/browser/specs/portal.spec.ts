@@ -64,3 +64,12 @@ test('posts logout from the authenticated portal', async ({ page }) => {
   await page.getByRole('button', { name: 'Sign out' }).click();
   await expect.poll(() => logoutRequest).toBe(true);
 });
+
+test('exposes operational metrics without an API token', async ({ page }) => {
+  await page.goto('/');
+  const response = await page.request.get('/metrics');
+  expect(response.status()).toBe(200);
+  const metrics = await response.text();
+  expect(metrics).toContain('zephyr_http_requests_total');
+  expect(metrics).toContain('go_goroutines');
+});

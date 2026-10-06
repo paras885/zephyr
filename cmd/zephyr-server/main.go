@@ -4,7 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -22,6 +22,7 @@ import (
 	"github.com/zephyr-workflow/zephyr/pkg/portal"
 	"github.com/zephyr-workflow/zephyr/pkg/queue"
 	"github.com/zephyr-workflow/zephyr/pkg/store"
+	"github.com/zephyr-workflow/zephyr/pkg/telemetry"
 	"github.com/zephyr-workflow/zephyr/pkg/timer"
 )
 
@@ -35,10 +36,17 @@ func main() {
 	workflowDirectory := flag.String("workflows", envOr("ZEPHYR_WORKFLOWS_DIR", "workflows"), "directory containing .zephyr definitions")
 	token := flag.String("token", os.Getenv("ZEPHYR_SERVER_TOKEN"), "local or development-only static bearer token (or ZEPHYR_SERVER_TOKEN)")
 	migrateOnly := flag.Bool("migrate-only", false, "apply PostgreSQL schema migrations and exit")
+	cleanupOnly := flag.Bool("cleanup-only", false, "delete delivered outbox and completed lease records older than the configured retention period, then exit")
+	cleanupRetention := flag.Duration("cleanup-retention", 90*24*time.Hour, "age threshold for -cleanup-only (default 90 days)")
+	cleanupBatchSize := flag.Int("cleanup-batch-size", 1000, "maximum records deleted per table by -cleanup-only")
 	flag.Parse()
 
 	var err error
 	switch {
+	case *migrateOnly && *cleanupOnly:
+		err = fmt.Errorf("-migrate-only and -cleanup-only cannot be combined")
+	case *cleanupOnly:
+		err = cleanupPostgres(*postgresURL, *cleanupRetention, *cleanupBatchSize)
 	case *migrateOnly:
 		err = migratePostgres(*postgresURL)
 	case *postgresURL != "" || *amqpURL != "":
@@ -65,8 +73,36 @@ func main() {
 		err = run(*address, *databasePath, *workflowDirectory, *token)
 	}
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("Zephyr server stopped", "error", err)
+		os.Exit(1)
 	}
+}
+
+func cleanupPostgres(dataSource string, retention time.Duration, batchSize int) error {
+	if dataSource == "" {
+		return fmt.Errorf("DATABASE_URL is required for PostgreSQL retention cleanup")
+	}
+	if retention <= 0 || batchSize < 1 {
+		return fmt.Errorf("cleanup retention and batch size must be positive")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	executions, err := store.OpenPostgresStore(ctx, dataSource)
+	if err != nil {
+		return err
+	}
+	defer executions.Close()
+	result, err := executions.CleanupRetention(ctx, time.Now().Add(-retention), batchSize)
+	if err != nil {
+		return err
+	}
+	slog.Info("retention cleanup completed",
+		"cutoff", time.Now().Add(-retention).UTC(), "batch_size", batchSize,
+		"workflow_event_outbox_deleted", result.WorkflowEventOutboxDeleted,
+		"task_publication_outbox_deleted", result.TaskPublicationDeleted,
+		"completed_leases_deleted", result.CompletedLeasesDeleted,
+	)
+	return nil
 }
 
 func envOr(name, fallback string) string {
@@ -83,6 +119,15 @@ func run(address, databasePath, workflowDirectory, token string) error {
 }
 
 func serve(ctx context.Context, address, databasePath, workflowDirectory, token string) error {
+	sampleRatio, err := telemetry.TraceSampleRatioFromEnv()
+	if err != nil {
+		return err
+	}
+	observability, err := telemetry.New(ctx, "zephyr-server", sampleRatio)
+	if err != nil {
+		return err
+	}
+	defer shutdownTelemetry(observability)
 	executions, err := store.OpenSQLiteStore(ctx, databasePath)
 	if err != nil {
 		return err
@@ -92,6 +137,7 @@ func serve(ctx context.Context, address, databasePath, workflowDirectory, token 
 	workQueue := queue.NewMemoryQueue(256)
 	timers := timer.NewService(256)
 	engine := decider.NewWithTimer(executions, timers)
+	engine.SetMetricsRecorder(observability)
 	leases, err := lease.NewManagerWithStateStore(workQueue, timers, 256, executions)
 	if err != nil {
 		_ = workQueue.Close()
@@ -130,13 +176,17 @@ func serve(ctx context.Context, address, databasePath, workflowDirectory, token 
 			return err
 		}
 	}
-	handler, err := portal.New(apiHandler)
+	portalHandler, err := portal.New(apiHandler)
 	if err != nil {
 		return err
 	}
+	handler := observability.Handler(portalHandler)
+	root := http.NewServeMux()
+	root.Handle("/metrics", observability.MetricsHandler())
+	root.Handle("/", handler)
 	server := &http.Server{
 		Addr:              address,
-		Handler:           handler,
+		Handler:           root,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	dispatchContext, cancelDispatcher := context.WithCancel(ctx)
@@ -145,14 +195,25 @@ func serve(ctx context.Context, address, databasePath, workflowDirectory, token 
 	defer func() {
 		cancelDispatcher()
 		if err := <-dispatcherDone; err != nil {
-			log.Printf("task publication dispatcher stopped: %v", err)
+			slog.Error("task publication dispatcher stopped", "error", err)
+		}
+	}()
+	metricsContext, cancelMetrics := context.WithCancel(ctx)
+	metricsDone := make(chan error, 1)
+	go func() {
+		metricsDone <- observability.RunOperationalMetrics(metricsContext, executions, 15*time.Second, workQueue, nil)
+	}()
+	defer func() {
+		cancelMetrics()
+		if err := <-metricsDone; err != nil {
+			slog.Error("operational metrics collector stopped", "error", err)
 		}
 	}()
 	serverErrors := make(chan error, 1)
 	go func() { serverErrors <- server.ListenAndServe() }()
-	log.Printf("Zephyr portal listening at http://%s (%d workflows)", address, len(definitions))
+	slog.Info("Zephyr portal listening", "address", address, "workflow_count", len(definitions))
 	if token != "" {
-		log.Print("API bearer authentication is enabled")
+		slog.Info("local API bearer authentication is enabled")
 	}
 	select {
 	case <-ctx.Done():

@@ -239,6 +239,21 @@ func (session *rabbitSession) state() (*amqp.Channel, <-chan amqp.Confirmation, 
 	return session.channel, session.confirms, session.changed, session.generation
 }
 
+func (session *rabbitSession) queueDepth(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	channel, _, _, _ := session.state()
+	if channel == nil || channel.IsClosed() {
+		return 0, fmt.Errorf("RabbitMQ queue %q channel is unavailable", session.queueName)
+	}
+	info, err := channel.QueueInspect(session.queueName)
+	if err != nil {
+		return 0, fmt.Errorf("inspect RabbitMQ queue %q depth: %w", session.queueName, err)
+	}
+	return info.Messages, nil
+}
+
 func (session *rabbitSession) publish(ctx context.Context, exchange, routingKey string, publishing amqp.Publishing) error {
 	session.publishMu.Lock()
 	defer session.publishMu.Unlock()

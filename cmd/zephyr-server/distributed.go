@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -23,6 +23,7 @@ import (
 	"github.com/zephyr-workflow/zephyr/pkg/portal"
 	"github.com/zephyr-workflow/zephyr/pkg/queue"
 	"github.com/zephyr-workflow/zephyr/pkg/store"
+	"github.com/zephyr-workflow/zephyr/pkg/telemetry"
 	"github.com/zephyr-workflow/zephyr/pkg/timer"
 )
 
@@ -76,6 +77,15 @@ func serveDistributed(ctx context.Context, config distributedConfig) error {
 	if err := validateDistributedAuthConfig(config); err != nil {
 		return err
 	}
+	sampleRatio, err := telemetry.TraceSampleRatioFromEnv()
+	if err != nil {
+		return err
+	}
+	observability, err := telemetry.New(ctx, "zephyr-server", sampleRatio)
+	if err != nil {
+		return err
+	}
+	defer shutdownTelemetry(observability)
 	definitions, err := loadDefinitions(config.WorkflowDirectory)
 	if err != nil {
 		return err
@@ -106,6 +116,7 @@ func serveDistributed(ctx context.Context, config distributedConfig) error {
 
 	timers := timer.NewService(256)
 	engine := decider.NewWithTimer(executions, timers)
+	engine.SetMetricsRecorder(observability)
 	leases, err := lease.NewManagerWithStateStore(workQueue, timers, 256, executions)
 	if err != nil {
 		timers.Close()
@@ -167,20 +178,29 @@ func serveDistributed(ctx context.Context, config distributedConfig) error {
 		return portalErr
 	}
 	var ready atomic.Bool
+	observability.SetDependency("postgres", false)
+	observability.SetDependency("rabbitmq", false)
 	dependencyReady := func(requestContext context.Context) error {
 		if !ready.Load() {
 			return fmt.Errorf("server is starting or shutting down")
 		}
 		if err := executions.Ping(requestContext); err != nil {
+			observability.SetDependency("postgres", false)
 			return fmt.Errorf("PostgreSQL unavailable: %w", err)
 		}
+		observability.SetDependency("postgres", true)
 		if !manager.Ready() {
+			observability.SetDependency("rabbitmq", false)
 			return fmt.Errorf("RabbitMQ connection, channels, or consumers are unavailable")
 		}
+		observability.SetDependency("rabbitmq", true)
 		return nil
 	}
-	handler := withHealthRoutes(portalHandler, dependencyReady)
-	server := &http.Server{Addr: config.Address, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
+	handler := observability.Handler(withHealthRoutes(portalHandler, dependencyReady))
+	root := http.NewServeMux()
+	root.Handle("/metrics", observability.MetricsHandler())
+	root.Handle("/", handler)
+	server := &http.Server{Addr: config.Address, Handler: root, ReadHeaderTimeout: 5 * time.Second}
 	workerContext, cancelWorkers := context.WithCancel(ctx)
 	var workers sync.WaitGroup
 	startWorker := func(name string, run func(context.Context) error) {
@@ -196,7 +216,7 @@ func serveDistributed(ctx context.Context, config distributedConfig) error {
 				if err == nil {
 					err = fmt.Errorf("stopped unexpectedly")
 				}
-				log.Printf("%s stopped; restarting: %v", name, err)
+				slog.Error("background worker stopped; restarting", "worker", name, "error", err)
 				timer := time.NewTimer(backoff)
 				select {
 				case <-workerContext.Done():
@@ -223,8 +243,11 @@ func serveDistributed(ctx context.Context, config distributedConfig) error {
 	})
 	startWorker("lease expiry scanner", func(workerContext context.Context) error {
 		return leases.RunExpiryScanner(workerContext, 128, 250*time.Millisecond, func(err error) {
-			log.Printf("lease expiry scan: %v", err)
+			slog.Error("lease expiry scan failed", "error", err)
 		})
+	})
+	startWorker("operational metrics collector", func(workerContext context.Context) error {
+		return observability.RunOperationalMetrics(workerContext, executions, 15*time.Second, workQueue, completionQueue)
 	})
 	ready.Store(true)
 	defer func() {
@@ -235,7 +258,7 @@ func serveDistributed(ctx context.Context, config distributedConfig) error {
 
 	serverErrors := make(chan error, 1)
 	go func() { serverErrors <- server.ListenAndServe() }()
-	log.Printf("distributed Zephyr server listening at http://%s (%d workflows)", config.Address, len(definitions))
+	slog.Info("distributed Zephyr server listening", "address", config.Address, "workflow_count", len(definitions))
 	select {
 	case <-ctx.Done():
 		shutdownContext, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -246,6 +269,14 @@ func serveDistributed(ctx context.Context, config distributedConfig) error {
 			return nil
 		}
 		return err
+	}
+}
+
+func shutdownTelemetry(observability *telemetry.Runtime) {
+	shutdownContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := observability.Shutdown(shutdownContext); err != nil {
+		slog.Error("shutdown telemetry provider", "error", err)
 	}
 }
 

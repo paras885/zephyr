@@ -95,7 +95,7 @@ func TestMilestone5HTTPGatewayRunsWorkflowThroughInMemoryComponents(t *testing.T
 	if err := workerClient.Heartbeat(context.Background(), delivery, time.Second); err != nil {
 		t.Fatal(err)
 	}
-	heartbeats, err := workerClient.StartHeartbeat(context.Background(), delivery, 20*time.Millisecond, 100*time.Millisecond)
+	heartbeats, err := workerClient.StartHeartbeat(context.Background(), delivery, 20*time.Millisecond, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

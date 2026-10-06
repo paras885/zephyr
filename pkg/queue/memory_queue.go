@@ -93,6 +93,13 @@ func (queue *MemoryQueue) Receive(ctx context.Context, workerID string) (Deliver
 	}
 }
 
+func (queue *MemoryQueue) QueueDepth(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	return len(queue.items), nil
+}
+
 func (queue *MemoryQueue) Ack(ctx context.Context, deliveryID string) error {
 	if err := ctx.Err(); err != nil {
 		return err

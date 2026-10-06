@@ -4,9 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/zephyr-workflow/zephyr/pkg/store"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type OutboxDispatcherConfig struct {
@@ -62,18 +67,33 @@ func (dispatcher *OutboxDispatcher) DispatchOnce(ctx context.Context) (int, erro
 		if err := ctx.Err(); err != nil {
 			return delivered, err
 		}
-		if err := dispatcher.publisher.Publish(ctx, record.Event); err != nil {
+		publishContext, span := otel.Tracer("zephyr/eventbus").Start(ctx, "event.publish", trace.WithAttributes(
+			attribute.String("workflow.id", record.Event.WorkflowID),
+			attribute.Int64("event.sequence", int64(record.Event.Sequence)),
+			attribute.String("event.type", string(record.Event.Type)),
+		))
+		if err := dispatcher.publisher.Publish(publishContext, record.Event); err != nil {
+			slog.WarnContext(publishContext, "workflow event outbox publish failed", "workflow_id", record.Event.WorkflowID, "event_sequence", record.Event.Sequence, "event_type", record.Event.Type, "error", err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "event publish failed")
 			if retryErr := dispatcher.outbox.RetryOutbox(ctx, record, dispatcher.config.RetryDelay); retryErr != nil {
 				failures = append(failures, errors.Join(fmt.Errorf("publish workflow event %s:%d: %w", record.Event.WorkflowID, record.Event.Sequence, err), fmt.Errorf("release event for retry: %w", retryErr)))
+				span.RecordError(retryErr)
+				span.End()
 				continue
 			}
 			failures = append(failures, fmt.Errorf("publish workflow event %s:%d: %w", record.Event.WorkflowID, record.Event.Sequence, err))
+			span.End()
 			continue
 		}
 		if err := dispatcher.outbox.MarkOutboxDelivered(ctx, record); err != nil {
 			failures = append(failures, fmt.Errorf("mark workflow event %s:%d delivered: %w", record.Event.WorkflowID, record.Event.Sequence, err))
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "mark event delivered failed")
+			span.End()
 			continue
 		}
+		span.End()
 		delivered++
 	}
 	return delivered, errors.Join(failures...)

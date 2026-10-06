@@ -58,6 +58,27 @@ func TestMemoryQueueDeliversOneItemToExactlyOneWorker(t *testing.T) {
 	}
 }
 
+func TestMemoryQueueDepthTracksReadyItems(t *testing.T) {
+	workQueue := NewMemoryQueue(2)
+	defer workQueue.Close()
+	for _, id := range []string{"depth-1", "depth-2"} {
+		if err := workQueue.Publish(context.Background(), WorkItem{ID: id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	depth, err := workQueue.QueueDepth(context.Background())
+	if err != nil || depth != 2 {
+		t.Fatalf("queued depth = %d, err=%v", depth, err)
+	}
+	if _, err := workQueue.Receive(context.Background(), "worker"); err != nil {
+		t.Fatal(err)
+	}
+	depth, err = workQueue.QueueDepth(context.Background())
+	if err != nil || depth != 1 {
+		t.Fatalf("depth after receive = %d, err=%v", depth, err)
+	}
+}
+
 func TestMemoryQueueRejectRequeuesItem(t *testing.T) {
 	queue := NewMemoryQueue(1)
 	defer queue.Close()

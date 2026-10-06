@@ -30,6 +30,9 @@ var postgresTaskPublicationMigration []byte
 //go:embed migrations/0005_shared_task_leases.sql
 var postgresLeaseMigration []byte
 
+//go:embed migrations/0006_retention.sql
+var postgresRetentionMigration []byte
+
 const postgresMigrationVersion = 1
 
 type PostgresStore struct {
@@ -162,6 +165,17 @@ func MigratePostgres(ctx context.Context, db *sql.DB) error {
 		}
 		if _, err := transaction.ExecContext(ctx, `INSERT INTO schema_migrations (version) VALUES (5) ON CONFLICT DO NOTHING`); err != nil {
 			return fmt.Errorf("record PostgreSQL lease migration: %w", err)
+		}
+	}
+	if err := transaction.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = 6)`).Scan(&applied); err != nil {
+		return fmt.Errorf("check PostgreSQL retention migration version: %w", err)
+	}
+	if !applied {
+		if _, err := transaction.ExecContext(ctx, string(postgresRetentionMigration)); err != nil {
+			return fmt.Errorf("apply PostgreSQL retention migration: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, `INSERT INTO schema_migrations (version) VALUES (6) ON CONFLICT DO NOTHING`); err != nil {
+			return fmt.Errorf("record PostgreSQL retention migration: %w", err)
 		}
 	}
 	if err := transaction.Commit(); err != nil {

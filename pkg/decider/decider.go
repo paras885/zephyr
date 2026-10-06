@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -11,6 +12,10 @@ import (
 	"github.com/zephyr-workflow/zephyr/pkg/lease"
 	"github.com/zephyr-workflow/zephyr/pkg/store"
 	"github.com/zephyr-workflow/zephyr/pkg/timer"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -20,6 +25,7 @@ const (
 
 type Decider struct {
 	store          executionStore
+	metrics        MetricsRecorder
 	timers         *timer.Service
 	timerEvents    <-chan timer.Deadline
 	unsubscribe    func()
@@ -32,6 +38,10 @@ type executionStore interface {
 	Get(workflowID string) (*domain.WorkflowInstance, error)
 	Append(workflowID string, event domain.Event) error
 	AppendMany(workflowID string, events []domain.Event) error
+}
+
+type MetricsRecorder interface {
+	RecordOperation(operation, result string, duration time.Duration)
 }
 
 type taskRetryReference struct {
@@ -55,6 +65,16 @@ func NewWithTimer(store store.ExecutionStore, timers *timer.Service) *Decider {
 
 func (decider *Decider) SetRetryPublisher(publish func(workflowID string) error) {
 	decider.retryPublisher = publish
+}
+
+func (decider *Decider) SetMetricsRecorder(metrics MetricsRecorder) {
+	decider.metrics = metrics
+}
+
+func (decider *Decider) recordOperation(operation, result string, duration time.Duration) {
+	if decider.metrics != nil {
+		decider.metrics.RecordOperation(operation, result, duration)
+	}
 }
 
 func (decider *Decider) Close() {
@@ -306,13 +326,21 @@ func (decider *Decider) failTaskLocked(workflowID, nodeID, taskError string) err
 		return fmt.Errorf("task node %q has status %s", nodeID, task.Status)
 	}
 	if task.Attempt <= task.RetryLimit {
+		_, span := otel.Tracer("zephyr/decider").Start(context.Background(), "task.retry_schedule")
+		span.SetAttributes(attribute.String("workflow.id", workflowID), attribute.String("task.id", task.ID), attribute.String("task.node_id", nodeID), attribute.Int("task.next_attempt", task.Attempt+1))
+		defer span.End()
 		retryAt := time.Now().Add(task.RetryBackoff)
 		if err := decider.store.AppendMany(workflowID, []domain.Event{
 			{WorkflowID: workflowID, TaskID: task.ID, NodeID: nodeID, Type: domain.EventTaskFailed, Payload: map[string]any{"error": taskError}},
 			{WorkflowID: workflowID, TaskID: task.ID, NodeID: nodeID, Type: domain.EventTaskRetryScheduled, Payload: map[string]any{"error": taskError, "retry_at": retryAt, "attempt": task.Attempt + 1}},
 		}); err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "schedule retry failed")
+			decider.recordOperation("task_retry_schedule", "error", 0)
 			return err
 		}
+		slog.Warn("task retry scheduled", "workflow_id", workflowID, "task_id", task.ID, "node_id", nodeID, "attempt", task.Attempt+1, "retry_at", retryAt)
+		decider.recordOperation("task_retry_schedule", "scheduled", 0)
 		if task.IsCompensation {
 			updated, err := decider.store.Get(workflowID)
 			if err != nil {
@@ -323,10 +351,19 @@ func (decider *Decider) failTaskLocked(workflowID, nodeID, taskError string) err
 		return decider.advanceUnlocked(workflowID)
 	}
 	if task.IsCompensation {
-		return decider.store.AppendMany(workflowID, []domain.Event{
+		_, span := otel.Tracer("zephyr/decider").Start(context.Background(), "compensation.failed", trace.WithAttributes(
+			attribute.String("workflow.id", workflowID), attribute.String("task.id", task.ID), attribute.String("task.node_id", nodeID),
+		))
+		defer span.End()
+		err := decider.store.AppendMany(workflowID, []domain.Event{
 			{WorkflowID: workflowID, TaskID: task.ID, NodeID: nodeID, Type: domain.EventTaskFailed, Payload: map[string]any{"error": taskError}},
 			{WorkflowID: workflowID, Type: domain.EventWorkflowFailed, Payload: map[string]any{"error": "compensation failed: " + taskError}},
 		})
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "persist compensation failure failed")
+		}
+		return err
 	}
 	if task.FanOutID != "" {
 		if err := decider.store.AppendMany(workflowID, []domain.Event{
@@ -350,8 +387,12 @@ func (decider *Decider) failTaskLocked(workflowID, nodeID, taskError string) err
 }
 
 func (decider *Decider) scheduleNextCompensation(workflowID string) error {
+	_, span := otel.Tracer("zephyr/decider").Start(context.Background(), "compensation.schedule", trace.WithAttributes(attribute.String("workflow.id", workflowID)))
+	defer span.End()
 	instance, err := decider.store.Get(workflowID)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "read compensation state failed")
 		return err
 	}
 	compensated := make(map[string]bool)
@@ -415,11 +456,22 @@ func (decider *Decider) scheduleNextCompensation(workflowID string) error {
 }
 
 func (decider *Decider) withWorkflowLock(workflowID string, operation func() error) error {
+	started := time.Now()
 	locker, ok := decider.store.(store.WorkflowLocker)
+	var err error
 	if !ok {
-		return operation()
+		err = operation()
+	} else {
+		err = locker.WithWorkflowLock(context.Background(), workflowID, operation)
 	}
-	return locker.WithWorkflowLock(context.Background(), workflowID, operation)
+	result := "success"
+	if errors.Is(err, store.ErrConflict) {
+		result = "conflict"
+	} else if err != nil {
+		result = "error"
+	}
+	decider.recordOperation("workflow_decision_lock", result, time.Since(started))
+	return err
 }
 
 // withStore returns a shallow copy of the decider that routes store mutations
@@ -428,6 +480,7 @@ func (decider *Decider) withWorkflowLock(workflowID string, operation func() err
 func (decider *Decider) withStore(mutationStore executionStore) *Decider {
 	return &Decider{
 		store:          mutationStore,
+		metrics:        decider.metrics,
 		timers:         decider.timers,
 		retryPublisher: decider.retryPublisher,
 		done:           decider.done,
@@ -447,11 +500,20 @@ func (decider *Decider) advanceUnlocked(workflowID string) error {
 		if !errors.Is(err, store.ErrConflict) {
 			return err
 		}
+		decider.recordOperation("workflow_decision_conflict", "conflict", 0)
 	}
 	return err
 }
 
-func (decider *Decider) advanceOnce(workflowID string) error {
+func (decider *Decider) advanceOnce(workflowID string) (returnErr error) {
+	_, span := otel.Tracer("zephyr/decider").Start(context.Background(), "workflow.schedule", trace.WithAttributes(attribute.String("workflow.id", workflowID)))
+	defer func() {
+		if returnErr != nil {
+			span.RecordError(returnErr)
+			span.SetStatus(codes.Error, "workflow scheduling failed")
+		}
+		span.End()
+	}()
 	for {
 		instance, err := decider.store.Get(workflowID)
 		if err != nil {

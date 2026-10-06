@@ -116,6 +116,23 @@ func (queue *RabbitMQQueue) Publish(ctx context.Context, item WorkItem) error {
 	return nil
 }
 
+func (queue *RabbitMQQueue) QueueDepth(ctx context.Context) (int, error) {
+	if queue.session != nil {
+		return queue.session.queueDepth(ctx)
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if queue.channel == nil || queue.channel.IsClosed() {
+		return 0, ErrClosed
+	}
+	info, err := queue.channel.QueueInspect(queue.name)
+	if err != nil {
+		return 0, fmt.Errorf("inspect RabbitMQ task queue depth: %w", err)
+	}
+	return info.Messages, nil
+}
+
 func (queue *RabbitMQQueue) publishLegacy(ctx context.Context, publishing amqp.Publishing) error {
 	if err := queue.channel.PublishWithContext(ctx, "", queue.name, false, false, publishing); err != nil {
 		return err

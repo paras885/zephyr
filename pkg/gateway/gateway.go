@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"reflect"
 	"sort"
@@ -20,6 +21,10 @@ import (
 	"github.com/zephyr-workflow/zephyr/pkg/lease"
 	"github.com/zephyr-workflow/zephyr/pkg/queue"
 	"github.com/zephyr-workflow/zephyr/pkg/store"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -371,21 +376,32 @@ func summarizeRun(instance *domain.WorkflowInstance) WorkflowRunSummary {
 }
 
 func (gateway *Gateway) StartWorkflow(ctx context.Context, name string, version int, workflowContext map[string]any) (*domain.WorkflowInstance, error) {
+	ctx, span := otel.Tracer("zephyr/gateway").Start(ctx, "workflow.start", trace.WithAttributes(attribute.String("workflow.name", name), attribute.Int("workflow.version", version)))
+	defer span.End()
 	definition, err := gateway.definition(name, version)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "workflow definition lookup failed")
 		return nil, err
 	}
 	instance, err := gateway.engine.Start(definition, workflowContext)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "workflow start failed")
 		return nil, err
 	}
+	span.SetAttributes(attribute.String("workflow.id", instance.ID))
 	if err := gateway.dispatchTaskPublications(ctx); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "task publication dispatch failed")
 		return nil, err
 	}
 	return instance, nil
 }
 
 func (gateway *Gateway) StartWorkflowIdempotent(ctx context.Context, name string, version int, workflowContext map[string]any, key string) (*domain.WorkflowInstance, error) {
+	ctx, span := otel.Tracer("zephyr/gateway").Start(ctx, "workflow.start_idempotent", trace.WithAttributes(attribute.String("workflow.name", name), attribute.Int("workflow.version", version)))
+	defer span.End()
 	key = strings.TrimSpace(key)
 	if key == "" {
 		return nil, fmt.Errorf("Idempotency-Key must not be empty")
@@ -426,15 +442,22 @@ func (gateway *Gateway) StartWorkflowIdempotent(ctx context.Context, name string
 		}
 	}
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "idempotent workflow start failed")
 		return nil, err
 	}
+	span.SetAttributes(attribute.String("workflow.id", instance.ID))
 	if err := gateway.dispatchTaskPublications(ctx); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "task publication dispatch failed")
 		return nil, err
 	}
 	return instance, nil
 }
 
 func (gateway *Gateway) ReceiveWork(ctx context.Context, workerID string, leaseDuration time.Duration) (WorkDelivery, error) {
+	ctx, span := otel.Tracer("zephyr/gateway").Start(ctx, "worker.receive", trace.WithAttributes(attribute.String("worker.id", workerID)))
+	defer span.End()
 	if workerID == "" {
 		return WorkDelivery{}, fmt.Errorf("worker ID is required")
 	}
@@ -444,6 +467,10 @@ func (gateway *Gateway) ReceiveWork(ctx context.Context, workerID string, leaseD
 	for {
 		delivery, err := gateway.workQueue.Receive(ctx, workerID)
 		if err != nil {
+			if ctx.Err() == nil {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, "receive work failed")
+			}
 			return WorkDelivery{}, err
 		}
 		activeLease, err := gateway.leases.Acquire(ctx, delivery, leaseDuration)
@@ -468,6 +495,11 @@ func (gateway *Gateway) ReceiveWork(ctx context.Context, workerID string, leaseD
 			}
 			return WorkDelivery{}, err
 		}
+		slog.InfoContext(ctx, "task work leased",
+			"worker_id", workerID, "workflow_id", activeLease.Item.WorkflowID,
+			"task_id", activeLease.Item.TaskID, "node_id", activeLease.Item.NodeID,
+			"lease_id", activeLease.ID, "fencing_token", activeLease.Token,
+		)
 		return WorkDelivery{
 			DeliveryID: delivery.ID,
 			LeaseID:    activeLease.ID,
@@ -478,6 +510,11 @@ func (gateway *Gateway) ReceiveWork(ctx context.Context, workerID string, leaseD
 }
 
 func (gateway *Gateway) CompleteWork(ctx context.Context, completion TaskCompletion) error {
+	ctx, span := otel.Tracer("zephyr/gateway").Start(ctx, "task.complete", trace.WithAttributes(
+		attribute.String("workflow.id", completion.WorkflowID), attribute.String("task.id", completion.TaskID),
+		attribute.String("lease.id", completion.LeaseID), attribute.Int64("lease.fencing_token", int64(completion.LeaseToken)),
+	))
+	defer span.End()
 	return gateway.finishTask(ctx, completion.WorkflowID, completion.TaskID, completion.NodeID, completion.LeaseID, completion.LeaseToken, func(activeLease lease.Lease, mutation lease.MutationStore) error {
 		if activeLease.Item.WorkflowID != completion.WorkflowID || activeLease.Item.TaskID != completion.TaskID || activeLease.Item.NodeID != completion.NodeID || activeLease.Token != completion.LeaseToken {
 			return ErrInvalidTaskLease
@@ -510,16 +547,30 @@ func (gateway *Gateway) CompleteWork(ctx context.Context, completion TaskComplet
 }
 
 func (gateway *Gateway) HeartbeatWork(ctx context.Context, heartbeat TaskHeartbeat) error {
+	ctx, span := otel.Tracer("zephyr/gateway").Start(ctx, "task.heartbeat", trace.WithAttributes(
+		attribute.String("lease.id", heartbeat.LeaseID), attribute.Int64("lease.fencing_token", int64(heartbeat.LeaseToken)),
+	))
+	defer span.End()
 	if heartbeat.LeaseID == "" || heartbeat.LeaseToken == 0 {
 		return fmt.Errorf("lease ID and lease token are required")
 	}
 	if heartbeat.LeaseDurationMS <= 0 {
 		return fmt.Errorf("lease duration must be positive")
 	}
-	return gateway.leases.Heartbeat(ctx, heartbeat.LeaseID, heartbeat.LeaseToken, time.Duration(heartbeat.LeaseDurationMS)*time.Millisecond)
+	err := gateway.leases.Heartbeat(ctx, heartbeat.LeaseID, heartbeat.LeaseToken, time.Duration(heartbeat.LeaseDurationMS)*time.Millisecond)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "lease heartbeat failed")
+	}
+	return err
 }
 
 func (gateway *Gateway) FailWork(ctx context.Context, failure TaskFailure) error {
+	ctx, span := otel.Tracer("zephyr/gateway").Start(ctx, "task.fail", trace.WithAttributes(
+		attribute.String("workflow.id", failure.WorkflowID), attribute.String("task.id", failure.TaskID),
+		attribute.String("lease.id", failure.LeaseID), attribute.Int64("lease.fencing_token", int64(failure.LeaseToken)),
+	))
+	defer span.End()
 	return gateway.finishTask(ctx, failure.WorkflowID, failure.TaskID, failure.NodeID, failure.LeaseID, failure.LeaseToken, func(activeLease lease.Lease, mutation lease.MutationStore) error {
 		if activeLease.Item.WorkflowID != failure.WorkflowID || activeLease.Item.TaskID != failure.TaskID || activeLease.Item.NodeID != failure.NodeID || activeLease.Token != failure.LeaseToken {
 			return ErrInvalidTaskLease
@@ -597,6 +648,11 @@ func (gateway *Gateway) RunCompletionConsumer(ctx context.Context, completions q
 }
 
 func (gateway *Gateway) applyCompletion(ctx context.Context, message queue.CompletionMessage) error {
+	ctx, span := otel.Tracer("zephyr/gateway").Start(ctx, "completion.apply", trace.WithAttributes(
+		attribute.String("workflow.id", message.WorkflowID), attribute.String("task.id", message.TaskID),
+		attribute.String("lease.id", message.LeaseID), attribute.String("completion.kind", string(message.Kind)),
+	))
+	defer span.End()
 	switch message.Kind {
 	case queue.CompletionSucceeded:
 		return gateway.CompleteWork(ctx, TaskCompletion{
@@ -640,6 +696,10 @@ func (gateway *Gateway) finishTask(ctx context.Context, workflowID, taskID, node
 	if err := gateway.leases.CompleteWith(ctx, leaseID, token, operation); err != nil {
 		return err
 	}
+	slog.InfoContext(ctx, "task lease transition committed",
+		"workflow_id", workflowID, "task_id", taskID, "node_id", nodeID,
+		"lease_id", leaseID, "fencing_token", token, "attempt", task.Attempt,
+	)
 	return gateway.dispatchTaskPublications(ctx)
 }
 

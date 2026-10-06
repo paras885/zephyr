@@ -98,6 +98,23 @@ func (queue *RabbitMQCompletionQueue) PublishCompletion(ctx context.Context, mes
 	}
 }
 
+func (queue *RabbitMQCompletionQueue) QueueDepth(ctx context.Context) (int, error) {
+	if queue.session != nil {
+		return queue.session.queueDepth(ctx)
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if queue.channel == nil || queue.channel.IsClosed() {
+		return 0, ErrClosed
+	}
+	info, err := queue.channel.QueueInspect(queue.name)
+	if err != nil {
+		return 0, fmt.Errorf("inspect RabbitMQ completion queue depth: %w", err)
+	}
+	return info.Messages, nil
+}
+
 func (queue *RabbitMQCompletionQueue) ReceiveCompletion(ctx context.Context, consumerID string) (CompletionDelivery, error) {
 	if consumerID == "" {
 		return CompletionDelivery{}, fmt.Errorf("completion consumer ID is required")

@@ -34,3 +34,7 @@ type QueueDAO interface {
 	Reject(ctx context.Context, deliveryID string, requeue bool) error
 	Close() error
 }
+
+type QueueDepthProvider interface {
+	QueueDepth(ctx context.Context) (int, error)
+}

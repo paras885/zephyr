@@ -31,6 +31,9 @@ var sqliteTaskPublicationMigration []byte
 //go:embed migrations/0005_sqlite_task_leases.sql
 var sqliteTaskLeaseMigration []byte
 
+//go:embed migrations/0006_sqlite_retention.sql
+var sqliteRetentionMigration []byte
+
 type SQLiteStore struct {
 	db             *sql.DB
 	workflowLockMu sync.Mutex
@@ -160,6 +163,17 @@ func (store *SQLiteStore) Migrate(ctx context.Context) error {
 		}
 		if _, err := transaction.ExecContext(ctx, `INSERT INTO schema_migrations (version) VALUES (5) ON CONFLICT DO NOTHING`); err != nil {
 			return fmt.Errorf("record SQLite task lease migration: %w", err)
+		}
+	}
+	if err := transaction.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = 6)`).Scan(&applied); err != nil {
+		return fmt.Errorf("check SQLite retention migration version: %w", err)
+	}
+	if !applied {
+		if _, err := transaction.ExecContext(ctx, string(sqliteRetentionMigration)); err != nil {
+			return fmt.Errorf("apply SQLite retention migration: %w", err)
+		}
+		if _, err := transaction.ExecContext(ctx, `INSERT INTO schema_migrations (version) VALUES (6) ON CONFLICT DO NOTHING`); err != nil {
+			return fmt.Errorf("record SQLite retention migration: %w", err)
 		}
 	}
 	if err := transaction.Commit(); err != nil {

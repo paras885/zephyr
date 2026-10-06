@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadsExampleWorkflowDefinitions(t *testing.T) {
@@ -62,6 +63,18 @@ func TestHealthRoutesSeparateLivenessAndReadiness(t *testing.T) {
 func TestMigratePostgresRequiresConnectionString(t *testing.T) {
 	if err := migratePostgres(""); err == nil {
 		t.Fatal("migratePostgres accepted an empty connection string")
+	}
+}
+
+func TestCleanupPostgresValidatesConfigurationBeforeConnecting(t *testing.T) {
+	if err := cleanupPostgres("", 90*24*time.Hour, 1000); err == nil || !strings.Contains(err.Error(), "DATABASE_URL") {
+		t.Fatalf("missing database URL cleanup error = %v", err)
+	}
+	if err := cleanupPostgres("postgres://unreachable", 0, 1000); err == nil {
+		t.Fatal("cleanup accepted a nonpositive retention period")
+	}
+	if err := cleanupPostgres("postgres://unreachable", 90*24*time.Hour, 0); err == nil {
+		t.Fatal("cleanup accepted a nonpositive batch size")
 	}
 }
 

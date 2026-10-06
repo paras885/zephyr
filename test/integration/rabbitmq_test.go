@@ -73,9 +73,17 @@ func TestRabbitMQQueueEndToEnd(t *testing.T) {
 	if err := workQueue.Publish(ctx, item); err != nil {
 		t.Fatal(err)
 	}
+	depth, err := workQueue.QueueDepth(ctx)
+	if err != nil || depth != 1 {
+		t.Fatalf("RabbitMQ task queue depth after publish = %d, err=%v", depth, err)
+	}
 	first, err := workQueue.Receive(ctx, "worker-a")
 	if err != nil {
 		t.Fatal(err)
+	}
+	depth, err = workQueue.QueueDepth(ctx)
+	if err != nil || depth != 0 {
+		t.Fatalf("RabbitMQ task queue depth after receive = %d, err=%v", depth, err)
 	}
 	if first.Item.ID != item.ID || first.Item.WorkflowID != item.WorkflowID {
 		t.Fatalf("first delivery = %#v, want %#v", first.Item, item)

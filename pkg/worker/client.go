@@ -8,6 +8,10 @@ import (
 	"time"
 
 	"github.com/zephyr-workflow/zephyr/pkg/gateway"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type Transport interface {
@@ -50,13 +54,21 @@ func NewClient(transport Transport, workerID string, leaseDuration time.Duration
 }
 
 func (client *Client) Receive(ctx context.Context) (gateway.WorkDelivery, error) {
+	ctx, span := otel.Tracer("zephyr/worker").Start(ctx, "worker.receive", trace.WithAttributes(attribute.String("worker.id", client.workerID)))
+	defer span.End()
 	delivery, err := client.transport.Receive(ctx, gateway.ReceiveWorkRequest{
 		WorkerID:        client.workerID,
 		LeaseDurationMS: client.leaseDuration.Milliseconds(),
 	})
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "worker receive failed")
 		return gateway.WorkDelivery{}, err
 	}
+	span.SetAttributes(
+		attribute.String("workflow.id", delivery.Item.WorkflowID), attribute.String("task.id", delivery.Item.TaskID),
+		attribute.String("lease.id", delivery.LeaseID), attribute.Int64("lease.fencing_token", int64(delivery.LeaseToken)),
+	)
 	return delivery, nil
 }
 
@@ -73,14 +85,24 @@ func Decode[T any](delivery gateway.WorkDelivery) (Task[T], error) {
 }
 
 func (client *Client) Heartbeat(ctx context.Context, delivery gateway.WorkDelivery, duration time.Duration) error {
+	ctx, span := otel.Tracer("zephyr/worker").Start(ctx, "worker.heartbeat", trace.WithAttributes(
+		attribute.String("workflow.id", delivery.Item.WorkflowID), attribute.String("task.id", delivery.Item.TaskID),
+		attribute.String("lease.id", delivery.LeaseID), attribute.Int64("lease.fencing_token", int64(delivery.LeaseToken)),
+	))
+	defer span.End()
 	if duration <= 0 {
 		return fmt.Errorf("lease duration must be positive")
 	}
-	return client.transport.Heartbeat(ctx, gateway.TaskHeartbeat{
+	err := client.transport.Heartbeat(ctx, gateway.TaskHeartbeat{
 		LeaseID:         delivery.LeaseID,
 		LeaseToken:      delivery.LeaseToken,
 		LeaseDurationMS: duration.Milliseconds(),
 	})
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "worker heartbeat failed")
+	}
+	return err
 }
 
 func (client *Client) StartHeartbeat(ctx context.Context, delivery gateway.WorkDelivery, interval, duration time.Duration) (*HeartbeatLoop, error) {
@@ -149,11 +171,31 @@ func (loop *HeartbeatLoop) setError(err error) {
 }
 
 func (client *Client) Complete(ctx context.Context, completion gateway.TaskCompletion) error {
-	return client.transport.Complete(ctx, completion)
+	ctx, span := otel.Tracer("zephyr/worker").Start(ctx, "worker.complete", trace.WithAttributes(
+		attribute.String("workflow.id", completion.WorkflowID), attribute.String("task.id", completion.TaskID),
+		attribute.String("lease.id", completion.LeaseID), attribute.Int64("lease.fencing_token", int64(completion.LeaseToken)),
+	))
+	defer span.End()
+	err := client.transport.Complete(ctx, completion)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "worker completion failed")
+	}
+	return err
 }
 
 func (client *Client) Fail(ctx context.Context, failure gateway.TaskFailure) error {
-	return client.transport.Fail(ctx, failure)
+	ctx, span := otel.Tracer("zephyr/worker").Start(ctx, "worker.fail", trace.WithAttributes(
+		attribute.String("workflow.id", failure.WorkflowID), attribute.String("task.id", failure.TaskID),
+		attribute.String("lease.id", failure.LeaseID), attribute.Int64("lease.fencing_token", int64(failure.LeaseToken)),
+	))
+	defer span.End()
+	err := client.transport.Fail(ctx, failure)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "worker failure report failed")
+	}
+	return err
 }
 
 func Completion[T any](task Task[T], result map[string]any) gateway.TaskCompletion {

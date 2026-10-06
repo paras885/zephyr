@@ -21,6 +21,35 @@ type conflictOnceStore struct {
 	conflictsLeft int
 }
 
+type recordedOperation struct {
+	name     string
+	result   string
+	duration time.Duration
+}
+
+type testMetricsRecorder struct {
+	calls []recordedOperation
+}
+
+func (recorder *testMetricsRecorder) RecordOperation(name, result string, duration time.Duration) {
+	recorder.calls = append(recorder.calls, recordedOperation{name: name, result: result, duration: duration})
+}
+
+func TestWorkflowDecisionLockRecordsDurationAndConflict(t *testing.T) {
+	decider := New(store.NewMemoryStore())
+	metrics := &testMetricsRecorder{}
+	decider.SetMetricsRecorder(metrics)
+	if err := decider.withWorkflowLock("workflow-1", func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := decider.withWorkflowLock("workflow-1", func() error { return store.ErrConflict }); err != store.ErrConflict {
+		t.Fatalf("conflicting lock operation error = %v", err)
+	}
+	if len(metrics.calls) != 2 || metrics.calls[0].name != "workflow_decision_lock" || metrics.calls[0].result != "success" || metrics.calls[1].result != "conflict" {
+		t.Fatalf("recorded decision-lock metrics = %#v", metrics.calls)
+	}
+}
+
 func (memory *conflictOnceStore) Append(workflowID string, event domain.Event) error {
 	memory.mu.Lock()
 	if event.Type == memory.conflictType && memory.conflictsLeft > 0 {

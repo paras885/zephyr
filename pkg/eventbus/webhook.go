@@ -12,6 +12,10 @@ import (
 	"time"
 
 	"github.com/zephyr-workflow/zephyr/pkg/domain"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type WebhookConfig struct {
@@ -72,14 +76,24 @@ func (webhook *Webhook) Publish(ctx context.Context, event domain.Event) error {
 	if event.WorkflowID == "" || event.Sequence == 0 {
 		return fmt.Errorf("workflow ID and persisted event sequence are required")
 	}
+	endpoint, _ := url.Parse(webhook.endpoint)
+	ctx, span := otel.Tracer("zephyr/eventbus").Start(ctx, "webhook.deliver", trace.WithAttributes(
+		attribute.String("workflow.id", event.WorkflowID), attribute.Int64("event.sequence", int64(event.Sequence)),
+		attribute.String("event.type", string(event.Type)), attribute.String("server.address", endpoint.Hostname()),
+	))
+	defer span.End()
 	body, err := json.Marshal(event)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "encode webhook event failed")
 		return fmt.Errorf("encode workflow event: %w", err)
 	}
 	var lastErr error
 	for attempt := 0; attempt < webhook.maxAttempts; attempt++ {
 		request, err := http.NewRequestWithContext(ctx, http.MethodPost, webhook.endpoint, bytes.NewReader(body))
 		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "create webhook request failed")
 			return fmt.Errorf("create event webhook request: %w", err)
 		}
 		request.Header.Set("Content-Type", "application/json")
@@ -104,6 +118,7 @@ func (webhook *Webhook) Publish(ctx context.Context, event domain.Event) error {
 		} else {
 			lastErr = requestErr
 		}
+		span.AddEvent("webhook.attempt", trace.WithAttributes(attribute.Int("attempt", attempt+1)))
 		if attempt+1 == webhook.maxAttempts {
 			break
 		}
@@ -115,6 +130,8 @@ func (webhook *Webhook) Publish(ctx context.Context, event domain.Event) error {
 		case <-timer.C:
 		}
 	}
+	span.RecordError(lastErr)
+	span.SetStatus(codes.Error, "webhook delivery failed")
 	return fmt.Errorf("event webhook delivery failed after %d attempts: %w", webhook.maxAttempts, lastErr)
 }
 

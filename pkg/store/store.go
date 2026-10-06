@@ -65,6 +65,33 @@ type TaskPublicationStore interface {
 	RetryTaskPublication(ctx context.Context, record TaskPublicationRecord, delay time.Duration) error
 }
 
+type OperationalMetrics struct {
+	WorkflowStates               map[string]int64
+	TaskStates                   map[string]int64
+	LeaseStates                  map[string]int64
+	WorkflowEventOutboxPending   int64
+	WorkflowEventOutboxOldestAge time.Duration
+	WorkflowEventOutboxRetries   int64
+	TaskPublicationPending       int64
+	TaskPublicationOldestAge     time.Duration
+	TaskPublicationRetries       int64
+	ExpiredLeaseBacklog          int64
+}
+
+type OperationalMetricsStore interface {
+	OperationalMetrics(ctx context.Context) (OperationalMetrics, error)
+}
+
+type RetentionCleanupResult struct {
+	WorkflowEventOutboxDeleted int64
+	TaskPublicationDeleted     int64
+	CompletedLeasesDeleted     int64
+}
+
+type RetentionStore interface {
+	CleanupRetention(ctx context.Context, deliveredBefore time.Time, batchSize int) (RetentionCleanupResult, error)
+}
+
 type EventHistoryStore interface {
 	ListEvents(ctx context.Context, workflowID string, afterSequence uint64, limit int) ([]domain.Event, error)
 }
