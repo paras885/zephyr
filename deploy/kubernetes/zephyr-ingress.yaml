@@ -1,0 +1,21 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: zephyr-server
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - zephyr.example.com
+      secretName: zephyr-tls
+  rules:
+    - host: zephyr.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: zephyr-server
+                port:
+                  name: http

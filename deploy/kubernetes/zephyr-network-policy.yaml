@@ -1,0 +1,19 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: zephyr-server-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app: zephyr-server
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # Replace with the namespace label used by your ingress controller and metrics scraper.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8080

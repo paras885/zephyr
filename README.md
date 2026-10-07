@@ -106,13 +106,15 @@ Compose binds the HTTP port to loopback and enables the explicitly development-o
 
 ## Kubernetes
 
-The provider-neutral manifests expect externally managed PostgreSQL and RabbitMQ. Build and push one immutable image tag to a registry reachable by the cluster, then replace `zephyr:local` in both `deploy/kubernetes/zephyr-migrate.yaml` and `deploy/kubernetes/zephyr-server.yaml` with that image reference. Use the exact same image for both so migration and server run the same binary and baked workflow bundle:
+The provider-neutral manifests expect externally managed PostgreSQL and RabbitMQ. Build and push an image, then replace the syntactically valid all-zero digest placeholder with the exact immutable image digest in both `deploy/kubernetes/zephyr-migrate.yaml` and `deploy/kubernetes/zephyr-server.yaml`. Use the exact same digest for migration and server so they run the same binary and baked workflow bundle. CI builds and scans images but does not publish them.
 
 ```sh
 IMAGE=registry.example.com/team/zephyr:2026-10-04
 docker build -t "$IMAGE" .
 docker push "$IMAGE"
 ```
+
+Replace `IMAGE` with the registry digest reference (for example, `registry.example.com/team/zephyr@sha256:<digest>`), then update both manifests. Review CPU/memory requests and limits against measured workload. The starter ingress uses `nginx` and `zephyr.example.com`; set your TLS secret, hostname, and ingress class. Edit `zephyr-network-policy.yaml` selectors to permit your ingress, worker, and monitoring namespaces. Apply NetworkPolicy only after confirming the cluster CNI enforces it.
 
 Create the referenced Secret in the target namespace using connection URLs and OIDC client settings for your externally managed identity provider. Register `OIDC_REDIRECT_URL` as an exact callback URL at the provider, ending in `/auth/callback`. Generate independent cookie keys with `openssl rand -base64 32`; the issuer must expose standard OIDC discovery and sign JWT access tokens for the configured API audience. Configure provider scopes/roles so portal users can receive `zephyr:workflow:read` and `zephyr:workflow:start`, and worker identities can receive `zephyr:worker:execute`. The `zephyr:admin` scope grants all API scopes.
 
@@ -148,6 +150,17 @@ kubectl apply -f deploy/kubernetes/zephyr-server.yaml
 kubectl rollout status deployment/zephyr-server
 kubectl port-forward service/zephyr-server 8080:8080
 ```
+
+The local cluster lifecycle harness uses only the explicitly named disposable kind context and namespace:
+
+```sh
+brew install kind k6
+./scripts/validate-kind.sh
+```
+
+It builds `zephyr:kind`, creates disposable PostgreSQL/RabbitMQ dependencies, applies migrations before the server, and exercises two replicas, restart, scale, rollback, pod deletion, worker-node loss, broker outage/recovery, readiness, and workflow persistence. Set `RUN_K6=true` to run the baseline benchmark (5 workflow starts/sec, 50 workers, 5 minutes by default); override `STARTS_PER_SECOND`, `WORKERS`, and `DURATION` for other measurements. Benchmark output is measured capacity, not a production capacity promise. CI runs this disposable harness and uploads a k6 summary; it never targets an external cluster.
+
+Final production validation still requires a non-production cluster with externally managed PostgreSQL/RabbitMQ and the target ingress, network policy, monitoring, and identity configuration.
 
 The Deployment has two replicas, readiness/liveness/startup probes, a 30-second termination grace period, and non-root/read-only-root-filesystem security settings. The Service is internal `ClusterIP`; configure TLS and any external routing at your chosen ingress or proxy. To rerun the migration Job, delete the completed Job first as shown above.
 

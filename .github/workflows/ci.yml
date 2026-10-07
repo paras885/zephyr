@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: Go tests and static checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify formatting
+        run: test -z "$(gofmt -l .)"
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Package and command race tests
+        run: go test -race -count=1 ./pkg/... ./cmd/...
+      - name: Testcontainers integration tests
+        run: go test -race -count=1 -timeout 20m ./test/integration/
+      - name: Full module race tests
+        run: go test -race -count=1 ./...
+      - name: Go vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+      - name: Render production Kubernetes manifests
+        run: kubectl kustomize deploy/kubernetes > /tmp/zephyr-kubernetes.yaml
+
+  browser:
+    name: Playwright portal tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: test/browser/package-lock.json
+      - run: npm ci --prefix test/browser
+      - run: npm exec --prefix test/browser -- playwright install --with-deps chromium
+      - run: npm test --prefix test/browser
+      - run: npm audit --prefix test/browser --audit-level=high
+
+  image:
+    name: Container image build and scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        run: docker build --pull -t zephyr:ci .
+      - name: Scan image for high and critical vulnerabilities
+        run: docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.58.2 image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed zephyr:ci
+
+  kind-lifecycle:
+    name: Disposable kind lifecycle and baseline load
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install kind CLI
+        run: |
+          go install sigs.k8s.io/kind@v0.29.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - uses: grafana/setup-k6-action@v1
+      - name: Validate manifests, rollout, failure recovery, and baseline capacity
+        env:
+          KIND_CLUSTER_NAME: zephyr-ci-${{ github.run_id }}-${{ github.run_attempt }}
+          RUN_K6: "true"
+          DURATION: 5m
+          STARTS_PER_SECOND: 5
+          WORKERS: 50
+          K6_SUMMARY_PATH: kind-load-summary.json
+        run: ./scripts/validate-kind.sh
+      - name: Upload baseline capacity report
+        if: always() && hashFiles('kind-load-summary.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: kind-load-summary-${{ github.run_id }}
+          path: kind-load-summary.json
+          retention-days: 30

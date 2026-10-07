@@ -6,10 +6,12 @@ zephyr.db-wal
 zephyr-gen
 /bin/
 /dist/
+/.kind-build/
 
 # Editor / OS
 .DS_Store
 node_modules/
 test-results/
 playwright-report/
+kind-load-summary.json
 

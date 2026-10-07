@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: zephyr-runtime
+  namespace: zephyr-test
+type: Opaque
+stringData:
+  DATABASE_URL: postgres://zephyr:zephyr-test-only@postgres:5432/zephyr?sslmode=disable
+  AMQP_URL: amqp://zephyr:zephyr-test-only@rabbitmq:5672/
+  ZEPHYR_SERVER_TOKEN: zephyr-kind-test-only
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zephyr-migrate
+  namespace: zephyr-test
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 180
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: zephyr:kind
+          imagePullPolicy: IfNotPresent
+          args: ["-migrate-only"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: zephyr-runtime
+                  key: DATABASE_URL

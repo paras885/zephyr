@@ -17,8 +17,16 @@ spec:
           type: RuntimeDefault
       containers:
         - name: migrate
-          image: zephyr:local
+          # Keep this digest identical to the server Deployment image.
+          image: registry.example.com/zephyr@sha256:0000000000000000000000000000000000000000000000000000000000000000
           imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
           args: ["-migrate-only"]
           env:
             - name: DATABASE_URL

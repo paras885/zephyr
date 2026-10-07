@@ -24,9 +24,9 @@ Useful entry points: [README.md](README.md), [ROADMAP.md](ROADMAP.md), [cmd/zeph
 1. Lease-state changes, workflow events, projections, and publication outbox writes now commit in a single PostgreSQL transaction; fault/race integration coverage exists.
 2. RabbitMQ connections reconnect in-process with bounded backoff; queue topology and consumers re-arm and readiness recovers. Isolated single-channel fault injection and live cluster rollout behavior remain to validate.
 3. OIDC/JWT validation, endpoint scopes, and PKCE-protected portal sessions are implemented. Deployment still requires provider-specific issuer/client/audience/scope configuration, secret provisioning/rotation, TLS, and validation against the target identity provider.
-4. The Kubernetes manifests have been parsed locally, but have not been applied to a real cluster or tested for rollout, drain, failure, upgrade, or rollback behavior.
+4. Production manifests render successfully and the kind harness has exercised migrations, rollout/restart, scaling, rollback, pod/node loss, broker outage/recovery, and workflow persistence. The manifests have not been validated against a real target cluster or its external dependencies.
 5. RabbitMQ quorum/DLX/delivery policy is configured and documented, and PostgreSQL backup/restore procedures and a Testcontainers restore drill are implemented. Provider-specific PITR validation and capacity limits remain open.
-6. Prometheus metrics, JSON structured logs, OTLP traces, starter alert rules, bounded retention cleanup, and backup/restore procedures are implemented. Alert/dashboard validation in the target monitoring environment, managed PITR verification against RPO/RTO, RabbitMQ restore drills, load/fault testing, and security scanning remain release gates.
+6. Prometheus metrics, JSON structured logs, OTLP traces, starter alert rules, bounded retention cleanup, and backup/restore procedures are implemented. Local kind load/fault validation and local Go/image security scans pass. Target monitoring validation, managed PITR verification against RPO/RTO, RabbitMQ restore drills, broader workload tests, and target-environment security validation remain release gates.
 
 ## Principles And Scope
 
@@ -168,6 +168,12 @@ Exit criteria:
 ### Phase 5: Cluster Validation, Capacity, And Release Gates
 
 Goal: prove the packaged system survives realistic multi-replica deployment and controlled failure.
+
+Implementation status: a disposable three-node kind cluster validated migration ordering, two-replica rollout/restart, scaling to three and back, pod deletion, rollback, worker-node loss/recovery, RabbitMQ outage/recovery, readiness, metrics, and workflow persistence. A five-minute local baseline at 5 workflow starts/sec and 50 worker VUs recorded 1,499 accepted starts, 1,609 task completions, 100% successful start/heartbeat/completion checks, zero failed HTTP requests, and 2 dropped iterations. Start latency was 1.41s median / 3.50s p95; task-completion latency was 3.89s median / 6.48s p95. This is one local kind/port-forward observation, not a supported-capacity claim; it does not establish production limits or external dependency behavior.
+
+Local verification passed: `go test -race -count=1 -timeout 20m ./...` (including Testcontainers), `go build ./...`, `go vet ./...`, `govulncheck`, three Playwright tests, npm audit, production and kind Kustomize rendering, Docker image build, and Trivy HIGH/CRITICAL scan (zero findings). The CI workflow is configured for these gates plus a disposable kind lifecycle/baseline run; an actual hosted GitHub Actions run remains pending.
+
+Remaining release gates: validate against a non-production target cluster using externally managed PostgreSQL/RabbitMQ; verify the target ingress, TLS, network policies, secret integration, monitoring/alerts, and provider-specific backup/PITR/restore; expand load coverage to retries, fan-out, delays, recovery scans, and outbox backlog; then establish supported limits from repeatable target-environment measurements. The production EKS context was not contacted during this local validation.
 
 Tasks:
 
