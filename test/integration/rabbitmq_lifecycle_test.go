@@ -403,9 +403,14 @@ func startRabbitLifecycleContainer(t *testing.T) (testcontainers.Container, stri
 			Image:        "rabbitmq:3.13-management-alpine",
 			Env:          map[string]string{"RABBITMQ_DEFAULT_USER": rabbitTestUser, "RABBITMQ_DEFAULT_PASS": rabbitTestPassword},
 			ExposedPorts: []string{"5672/tcp", "15672/tcp"},
+			// ForListeningPort alone is insufficient: RabbitMQ opens the AMQP
+			// TCP listener slightly before the broker finishes initializing,
+			// so early connections can be accepted and then reset. Wait for
+			// the broker's own readiness log line too.
 			WaitingFor: wait.ForAll(
 				wait.ForListeningPort("5672/tcp"),
 				wait.ForListeningPort("15672/tcp"),
+				wait.ForLog("Server startup complete"),
 			),
 			HostConfigModifier: func(hostConfig *dockercontainer.HostConfig) {
 				hostConfig.PortBindings = nat.PortMap{

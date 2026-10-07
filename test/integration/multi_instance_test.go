@@ -90,7 +90,14 @@ func TestTwoGatewayInstancesSharePostgresLeasesAndRabbitMQWork(t *testing.T) {
 	rabbitContainer, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: testcontainers.ContainerRequest{
 			Image: "rabbitmq:3.13-management-alpine", ExposedPorts: []string{"5672/tcp"},
-			WaitingFor: wait.ForListeningPort("5672/tcp"),
+			// ForListeningPort alone is insufficient: RabbitMQ opens the AMQP
+			// TCP listener slightly before the broker finishes initializing,
+			// so early connections can be accepted and then reset. Wait for
+			// the broker's own readiness log line too.
+			WaitingFor: wait.ForAll(
+				wait.ForListeningPort("5672/tcp"),
+				wait.ForLog("Server startup complete"),
+			),
 		}, Started: true,
 	})
 	if err != nil {
