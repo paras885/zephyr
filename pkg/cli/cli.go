@@ -62,6 +62,29 @@ func Run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	}
 	group, command := args[0], args[1]
 	opts := options{}
+	flags := newFlagSet(group, command, &opts, stderr)
+	positionals, err := parseArgs(args[2:], flags)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if group == "auth" {
+		if len(positionals) != 0 {
+			return fmt.Errorf("auth takes no positional arguments")
+		}
+		return runAuth(ctx, command, opts, out, stderr)
+	}
+	if err := validateWorkflowArgs(command, positionals); err != nil {
+		return err
+	}
+	return runWorkflowCommand(ctx, command, opts, positionals, out, stderr)
+}
+
+// newFlagSet builds the flag set shared by the workflow and auth command
+// groups, adding workflow-only flags when applicable.
+func newFlagSet(group, command string, opts *options, stderr io.Writer) *flag.FlagSet {
 	flags := flag.NewFlagSet(group+" "+command, flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() { fmt.Fprint(stderr, help) }
@@ -71,134 +94,184 @@ func Run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	flags.StringVar(&opts.caFile, "ca-file", os.Getenv("ZEPHYR_CA_FILE"), "additional trusted CA certificate")
 	flags.BoolVar(&opts.noBrowser, "no-browser", false, "print sign-in URL without opening browser")
 	if group == "workflow" {
-		flags.StringVar(&opts.file, "file", "workflow.zephyr", "definition file")
-		flags.StringVar(&opts.output, "output", ".", "artifact directory")
-		flags.StringVar(&opts.input, "input", "{}", "input JSON or @filename")
-		flags.StringVar(&opts.key, "idempotency-key", "", "start idempotency key")
-		flags.StringVar(&opts.status, "status", "", "run status filter")
-		version := 1
-		if command == "start" {
-			version = 0
-		}
-		flags.IntVar(&opts.version, "version", version, "workflow version")
-		flags.IntVar(&opts.limit, "limit", 25, "run count (1-100)")
-		flags.IntVar(&opts.offset, "offset", 0, "run offset")
-		flags.BoolVar(&opts.force, "force", false, "overwrite generated files")
+		addWorkflowFlags(flags, opts, command)
 	}
-	ordered, err := orderFlags(args[2:], flags)
+	return flags
+}
+
+func addWorkflowFlags(flags *flag.FlagSet, opts *options, command string) {
+	flags.StringVar(&opts.file, "file", "workflow.zephyr", "definition file")
+	flags.StringVar(&opts.output, "output", ".", "artifact directory")
+	flags.StringVar(&opts.input, "input", "{}", "input JSON or @filename")
+	flags.StringVar(&opts.key, "idempotency-key", "", "start idempotency key")
+	flags.StringVar(&opts.status, "status", "", "run status filter")
+	version := 1
+	if command == "start" {
+		version = 0
+	}
+	flags.IntVar(&opts.version, "version", version, "workflow version")
+	flags.IntVar(&opts.limit, "limit", 25, "run count (1-100)")
+	flags.IntVar(&opts.offset, "offset", 0, "run offset")
+	flags.BoolVar(&opts.force, "force", false, "overwrite generated files")
+}
+
+// parseArgs reorders args so positionals follow flags, then parses them.
+// A flag.ErrHelp result is returned unwrapped so callers can detect it.
+func parseArgs(args []string, flags *flag.FlagSet) ([]string, error) {
+	ordered, err := orderFlags(args, flags)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := flags.Parse(ordered); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return nil
-		}
-		return err
+		return nil, err
 	}
-	positionals := flags.Args()
-	if group == "auth" {
-		if len(positionals) != 0 {
-			return fmt.Errorf("auth takes no positional arguments")
-		}
-		return runAuth(ctx, command, opts, out, stderr)
-	}
+	return flags.Args(), nil
+}
+
+func validateWorkflowArgs(command string, positionals []string) error {
 	needsID := command == "start" || command == "status" || command == "runs"
 	if (needsID && len(positionals) != 1) || (!needsID && len(positionals) != 0) {
 		return fmt.Errorf("%s requires %s", command, map[bool]string{true: "one identifier", false: "flags only"}[needsID])
 	}
+	return nil
+}
+
+func runWorkflowCommand(ctx context.Context, command string, opts options, positionals []string, out, stderr io.Writer) error {
 	switch command {
 	case "generate":
-		if err := saveFiles(filepath.Dir(opts.file), map[string][]byte{filepath.Base(opts.file): []byte(sample)}, opts.force); err != nil {
-			return err
-		}
-		return printJSON(out, map[string]string{"file": opts.file})
+		return handleGenerate(opts, out)
 	case "validate", "artifacts", "publish":
-		source, err := os.ReadFile(opts.file)
-		if err != nil {
-			return fmt.Errorf("read workflow: %w", err)
-		}
-		definition, err := compiler.Compile(string(source))
-		if err != nil {
-			return fmt.Errorf("invalid workflow: %w", err)
-		}
-		if opts.version < 1 {
-			return fmt.Errorf("version must be positive")
-		}
-		files, err := generator.GenerateVersion(string(source), opts.version)
-		if err != nil {
-			return fmt.Errorf("invalid contracts: %w", err)
-		}
-		if command == "validate" {
-			return printJSON(out, map[string]any{"valid": true, "name": definition.Name, "version": opts.version})
-		}
-		if err := checkFiles(opts.output, files, opts.force); err != nil {
-			return err
-		}
-		if command == "publish" {
-			api, endpoint, err := authenticatedClient(ctx, opts, stderr)
-			if err != nil {
-				return err
-			}
-			record, err := api.RegisterWorkflow(ctx, string(source), opts.version)
-			if err != nil {
-				return describeAPIError(err)
-			}
-			files = make(map[string][]byte, len(record.Files))
-			for name, body := range record.Files {
-				files[name] = []byte(body)
-			}
-			files[".env.example"] = []byte("ZEPHYR_ENDPOINT=" + endpoint + "\nZEPHYR_TOKEN=\nZEPHYR_TIMEOUT=10s\n")
-		}
-		if err := saveFiles(opts.output, files, opts.force); err != nil {
-			if command == "publish" {
-				return fmt.Errorf("workflow registered, but artifacts could not be saved (retry with --force): %w", err)
-			}
-			return err
-		}
-		return printJSON(out, map[string]any{"name": definition.Name, "version": opts.version, "output": opts.output, "published": command == "publish"})
+		return handleDefinitionCommand(ctx, command, opts, out, stderr)
 	case "start", "status", "runs":
-		if opts.version < 0 {
-			return fmt.Errorf("version cannot be negative")
-		}
-		if command == "runs" && (opts.limit < 1 || opts.limit > 100 || opts.offset < 0) {
-			return fmt.Errorf("limit must be 1-100 and offset non-negative")
-		}
-		var input map[string]any
-		if command == "start" {
-			body := []byte(opts.input)
-			if strings.HasPrefix(opts.input, "@") {
-				body, err = os.ReadFile(strings.TrimPrefix(opts.input, "@"))
-				if err != nil {
-					return fmt.Errorf("read input: %w", err)
-				}
-			}
-			if err := json.Unmarshal(body, &input); err != nil || input == nil {
-				return fmt.Errorf("input must be a JSON object")
-			}
-		}
-		api, _, err := authenticatedClient(ctx, opts, stderr)
-		if err != nil {
-			return err
-		}
-		var result any
-		switch command {
-		case "start":
-			if opts.key != "" {
-				result, err = api.StartWorkflowWithIdempotencyKey(ctx, positionals[0], opts.version, input, opts.key)
-			} else {
-				result, err = api.StartWorkflow(ctx, positionals[0], opts.version, input)
-			}
-		case "status":
-			result, err = api.WorkflowRunDetails(ctx, positionals[0])
-		case "runs":
-			result, err = api.ListWorkflowRuns(ctx, positionals[0], opts.limit, opts.offset, opts.status)
-		}
-		if err != nil {
-			return describeAPIError(err)
-		}
-		return printJSON(out, result)
+		return handleRunCommand(ctx, command, opts, positionals, out, stderr)
 	default:
 		return fmt.Errorf("unknown workflow command %q; use zephyr --help", command)
+	}
+}
+
+func handleGenerate(opts options, out io.Writer) error {
+	if err := saveFiles(filepath.Dir(opts.file), map[string][]byte{filepath.Base(opts.file): []byte(sample)}, opts.force); err != nil {
+		return err
+	}
+	return printJSON(out, map[string]string{"file": opts.file})
+}
+
+// handleDefinitionCommand covers validate, artifacts, and publish: all three
+// compile the definition and generate contracts, and the latter two also
+// write files to disk (publish additionally registers the workflow first).
+func handleDefinitionCommand(ctx context.Context, command string, opts options, out, stderr io.Writer) error {
+	source, err := os.ReadFile(opts.file)
+	if err != nil {
+		return fmt.Errorf("read workflow: %w", err)
+	}
+	definition, err := compiler.Compile(string(source))
+	if err != nil {
+		return fmt.Errorf("invalid workflow: %w", err)
+	}
+	if opts.version < 1 {
+		return fmt.Errorf("version must be positive")
+	}
+	files, err := generator.GenerateVersion(string(source), opts.version)
+	if err != nil {
+		return fmt.Errorf("invalid contracts: %w", err)
+	}
+	if command == "validate" {
+		return printJSON(out, map[string]any{"valid": true, "name": definition.Name, "version": opts.version})
+	}
+	if err := checkFiles(opts.output, files, opts.force); err != nil {
+		return err
+	}
+	if command == "publish" {
+		if files, err = publishWorkflow(ctx, opts, stderr, string(source)); err != nil {
+			return err
+		}
+	}
+	if err := saveFiles(opts.output, files, opts.force); err != nil {
+		if command == "publish" {
+			return fmt.Errorf("workflow registered, but artifacts could not be saved (retry with --force): %w", err)
+		}
+		return err
+	}
+	return printJSON(out, map[string]any{"name": definition.Name, "version": opts.version, "output": opts.output, "published": command == "publish"})
+}
+
+func publishWorkflow(ctx context.Context, opts options, stderr io.Writer, source string) (map[string][]byte, error) {
+	api, endpoint, err := authenticatedClient(ctx, opts, stderr)
+	if err != nil {
+		return nil, err
+	}
+	record, err := api.RegisterWorkflow(ctx, source, opts.version)
+	if err != nil {
+		return nil, describeAPIError(err)
+	}
+	files := make(map[string][]byte, len(record.Files))
+	for name, body := range record.Files {
+		files[name] = []byte(body)
+	}
+	files[".env.example"] = []byte("ZEPHYR_ENDPOINT=" + endpoint + "\nZEPHYR_TOKEN=\nZEPHYR_TIMEOUT=10s\n")
+	return files, nil
+}
+
+func handleRunCommand(ctx context.Context, command string, opts options, positionals []string, out, stderr io.Writer) error {
+	if err := validateRunOptions(command, opts); err != nil {
+		return err
+	}
+	var input map[string]any
+	if command == "start" {
+		var err error
+		if input, err = loadInput(opts.input); err != nil {
+			return err
+		}
+	}
+	api, _, err := authenticatedClient(ctx, opts, stderr)
+	if err != nil {
+		return err
+	}
+	result, err := executeRunCommand(ctx, api, command, opts, positionals, input)
+	if err != nil {
+		return describeAPIError(err)
+	}
+	return printJSON(out, result)
+}
+
+func validateRunOptions(command string, opts options) error {
+	if opts.version < 0 {
+		return fmt.Errorf("version cannot be negative")
+	}
+	if command == "runs" && (opts.limit < 1 || opts.limit > 100 || opts.offset < 0) {
+		return fmt.Errorf("limit must be 1-100 and offset non-negative")
+	}
+	return nil
+}
+
+func loadInput(raw string) (map[string]any, error) {
+	body := []byte(raw)
+	if strings.HasPrefix(raw, "@") {
+		var err error
+		if body, err = os.ReadFile(strings.TrimPrefix(raw, "@")); err != nil {
+			return nil, fmt.Errorf("read input: %w", err)
+		}
+	}
+	var input map[string]any
+	if err := json.Unmarshal(body, &input); err != nil || input == nil {
+		return nil, fmt.Errorf("input must be a JSON object")
+	}
+	return input, nil
+}
+
+func executeRunCommand(ctx context.Context, api *client.Client, command string, opts options, positionals []string, input map[string]any) (any, error) {
+	switch command {
+	case "start":
+		if opts.key != "" {
+			return api.StartWorkflowWithIdempotencyKey(ctx, positionals[0], opts.version, input, opts.key)
+		}
+		return api.StartWorkflow(ctx, positionals[0], opts.version, input)
+	case "status":
+		return api.WorkflowRunDetails(ctx, positionals[0])
+	case "runs":
+		return api.ListWorkflowRuns(ctx, positionals[0], opts.limit, opts.offset, opts.status)
+	default:
+		return nil, fmt.Errorf("unknown workflow command %q", command)
 	}
 }
 

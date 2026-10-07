@@ -173,17 +173,8 @@ type Gateway struct {
 }
 
 func New(engine *decider.Decider, executions store.ExecutionStore, workQueue queue.QueueDAO, leases *lease.Manager) (*Gateway, error) {
-	if engine == nil {
-		return nil, fmt.Errorf("decider is required")
-	}
-	if executions == nil {
-		return nil, fmt.Errorf("execution store is required")
-	}
-	if workQueue == nil {
-		return nil, fmt.Errorf("work queue is required")
-	}
-	if leases == nil {
-		return nil, fmt.Errorf("lease manager is required")
+	if err := validateNewGatewayArgs(engine, executions, workQueue, leases); err != nil {
+		return nil, err
 	}
 	publicationStore, ok := executions.(store.TaskPublicationStore)
 	if !ok {
@@ -203,7 +194,28 @@ func New(engine *decider.Decider, executions store.ExecutionStore, workQueue que
 	engine.SetRetryPublisher(func(workflowID string) error {
 		return gateway.dispatchTaskPublications(context.Background())
 	})
-	leases.SetExpirationHandler(func(ctx context.Context, expiration lease.Expiration, mutation lease.MutationStore) error {
+	leases.SetExpirationHandler(gateway.handleLeaseExpiration(engine, executions))
+	return gateway, nil
+}
+
+func validateNewGatewayArgs(engine *decider.Decider, executions store.ExecutionStore, workQueue queue.QueueDAO, leases *lease.Manager) error {
+	if engine == nil {
+		return fmt.Errorf("decider is required")
+	}
+	if executions == nil {
+		return fmt.Errorf("execution store is required")
+	}
+	if workQueue == nil {
+		return fmt.Errorf("work queue is required")
+	}
+	if leases == nil {
+		return fmt.Errorf("lease manager is required")
+	}
+	return nil
+}
+
+func (gateway *Gateway) handleLeaseExpiration(engine *decider.Decider, executions store.ExecutionStore) func(context.Context, lease.Expiration, lease.MutationStore) error {
+	return func(ctx context.Context, expiration lease.Expiration, mutation lease.MutationStore) error {
 		activeLease := expiration.Lease
 		var instanceStore interface {
 			Get(string) (*domain.WorkflowInstance, error)
@@ -225,8 +237,7 @@ func New(engine *decider.Decider, executions store.ExecutionStore, workQueue que
 		default:
 			return engine.FailTaskWithMutation(activeLease.Item.WorkflowID, activeLease.Item.NodeID, "task lease expired", mutation)
 		}
-	})
-	return gateway, nil
+	}
 }
 
 func (gateway *Gateway) RegisterWorkflow(definition domain.WorkflowDef) error {
@@ -421,6 +432,22 @@ func (gateway *Gateway) StartWorkflowIdempotent(ctx context.Context, name string
 	if workflowContext == nil {
 		workflowContext = map[string]any{}
 	}
+	instance, err := gateway.createOrResumeIdempotentInstance(ctx, definition, workflowContext, key)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "idempotent workflow start failed")
+		return nil, err
+	}
+	span.SetAttributes(attribute.String("workflow.id", instance.ID))
+	if err := gateway.dispatchTaskPublications(ctx); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "task publication dispatch failed")
+		return nil, err
+	}
+	return instance, nil
+}
+
+func (gateway *Gateway) createOrResumeIdempotentInstance(ctx context.Context, definition domain.WorkflowDef, workflowContext map[string]any, key string) (*domain.WorkflowInstance, error) {
 	requestBody, err := json.Marshal(struct {
 		Version int            `json:"version"`
 		Context map[string]any `json:"context"`
@@ -442,25 +469,13 @@ func (gateway *Gateway) StartWorkflowIdempotent(ctx context.Context, name string
 		return nil, err
 	}
 	if created {
+		return gateway.engine.StartExisting(instance)
+	}
+	instance, err = gateway.executions.Get(existingID)
+	if err == nil && instance.Status == domain.WorkflowPending {
 		instance, err = gateway.engine.StartExisting(instance)
-	} else {
-		instance, err = gateway.executions.Get(existingID)
-		if err == nil && instance.Status == domain.WorkflowPending {
-			instance, err = gateway.engine.StartExisting(instance)
-		}
 	}
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, "idempotent workflow start failed")
-		return nil, err
-	}
-	span.SetAttributes(attribute.String("workflow.id", instance.ID))
-	if err := gateway.dispatchTaskPublications(ctx); err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, "task publication dispatch failed")
-		return nil, err
-	}
-	return instance, nil
+	return instance, err
 }
 
 func (gateway *Gateway) ReceiveWork(ctx context.Context, workerID string, leaseDuration time.Duration) (WorkDelivery, error) {
@@ -481,40 +496,48 @@ func (gateway *Gateway) ReceiveWork(ctx context.Context, workerID string, leaseD
 			}
 			return WorkDelivery{}, err
 		}
-		activeLease, err := gateway.leases.Acquire(ctx, delivery, leaseDuration)
-		if err != nil {
-			if gateway.leases.UsesSharedStateStore() && errors.Is(err, lease.ErrLeaseConflict) {
-				if ackErr := gateway.workQueue.Ack(ctx, delivery.ID); ackErr != nil {
-					return WorkDelivery{}, fmt.Errorf("ack duplicate leased task: %w", ackErr)
-				}
-				continue
-			}
-			_ = gateway.workQueue.Reject(context.Background(), delivery.ID, true)
-			return WorkDelivery{}, err
+		work, retry, err := gateway.leaseDelivery(ctx, workerID, delivery, leaseDuration)
+		if retry {
+			continue
 		}
-		if gateway.leases.UsesSharedStateStore() {
-			if err := gateway.workQueue.Ack(ctx, delivery.ID); err != nil {
-				return WorkDelivery{}, fmt.Errorf("ack task after durable lease claim: %w", err)
-			}
-		}
-		if err := gateway.engine.StartTask(delivery.Item.WorkflowID, delivery.Item.NodeID, activeLease.Token); err != nil {
-			if !gateway.leases.UsesSharedStateStore() {
-				_ = gateway.leases.Complete(context.Background(), activeLease.ID, activeLease.Token)
-			}
-			return WorkDelivery{}, err
-		}
-		slog.InfoContext(ctx, "task work leased",
-			"worker_id", workerID, "workflow_id", activeLease.Item.WorkflowID,
-			"task_id", activeLease.Item.TaskID, "node_id", activeLease.Item.NodeID,
-			"lease_id", activeLease.ID, "fencing_token", activeLease.Token,
-		)
-		return WorkDelivery{
-			DeliveryID: delivery.ID,
-			LeaseID:    activeLease.ID,
-			LeaseToken: activeLease.Token,
-			Item:       activeLease.Item,
-		}, nil
+		return work, err
 	}
+}
+
+func (gateway *Gateway) leaseDelivery(ctx context.Context, workerID string, delivery queue.Delivery, leaseDuration time.Duration) (WorkDelivery, bool, error) {
+	activeLease, err := gateway.leases.Acquire(ctx, delivery, leaseDuration)
+	if err != nil {
+		if gateway.leases.UsesSharedStateStore() && errors.Is(err, lease.ErrLeaseConflict) {
+			if ackErr := gateway.workQueue.Ack(ctx, delivery.ID); ackErr != nil {
+				return WorkDelivery{}, false, fmt.Errorf("ack duplicate leased task: %w", ackErr)
+			}
+			return WorkDelivery{}, true, nil
+		}
+		_ = gateway.workQueue.Reject(context.Background(), delivery.ID, true)
+		return WorkDelivery{}, false, err
+	}
+	if gateway.leases.UsesSharedStateStore() {
+		if err := gateway.workQueue.Ack(ctx, delivery.ID); err != nil {
+			return WorkDelivery{}, false, fmt.Errorf("ack task after durable lease claim: %w", err)
+		}
+	}
+	if err := gateway.engine.StartTask(delivery.Item.WorkflowID, delivery.Item.NodeID, activeLease.Token); err != nil {
+		if !gateway.leases.UsesSharedStateStore() {
+			_ = gateway.leases.Complete(context.Background(), activeLease.ID, activeLease.Token)
+		}
+		return WorkDelivery{}, false, err
+	}
+	slog.InfoContext(ctx, "task work leased",
+		"worker_id", workerID, "workflow_id", activeLease.Item.WorkflowID,
+		"task_id", activeLease.Item.TaskID, "node_id", activeLease.Item.NodeID,
+		"lease_id", activeLease.ID, "fencing_token", activeLease.Token,
+	)
+	return WorkDelivery{
+		DeliveryID: delivery.ID,
+		LeaseID:    activeLease.ID,
+		LeaseToken: activeLease.Token,
+		Item:       activeLease.Item,
+	}, false, nil
 }
 
 func (gateway *Gateway) CompleteWork(ctx context.Context, completion TaskCompletion) error {
@@ -751,60 +774,80 @@ func (gateway *Gateway) serveHTTP(response http.ResponseWriter, request *http.Re
 	case request.URL.Path == "/v1/workflows/register":
 		gateway.serveRegistration(response, request)
 	case request.URL.Path == TaskReceivePath || request.URL.Path == TaskPollPath:
-		var input ReceiveWorkRequest
-		if !decodeJSON(response, request, &input) {
-			return
-		}
-		leaseDuration := 30 * time.Second
-		if input.LeaseDurationMS > 0 {
-			leaseDuration = time.Duration(input.LeaseDurationMS) * time.Millisecond
-		}
-		output, err := gateway.ReceiveWork(ctx, input.WorkerID, leaseDuration)
-		writeResult(response, output, err)
+		gateway.serveReceiveWork(ctx, response, request)
 	case request.URL.Path == TaskCompletePath:
-		var input TaskCompletion
-		if !decodeJSON(response, request, &input) {
-			return
-		}
-		writeResult(response, map[string]string{"status": "completed"}, gateway.CompleteWork(ctx, input))
+		gateway.serveTaskComplete(ctx, response, request)
 	case request.URL.Path == TaskHeartbeatPath:
-		var input TaskHeartbeat
-		if !decodeJSON(response, request, &input) {
-			return
-		}
-		writeResult(response, map[string]string{"status": "renewed"}, gateway.HeartbeatWork(ctx, input))
+		gateway.serveTaskHeartbeat(ctx, response, request)
 	case request.URL.Path == TaskFailPath:
-		var input TaskFailure
-		if !decodeJSON(response, request, &input) {
-			return
-		}
-		writeResult(response, map[string]string{"status": "failed"}, gateway.FailWork(ctx, input))
+		gateway.serveTaskFail(ctx, response, request)
 	case strings.HasPrefix(request.URL.Path, WorkflowInstancesPath) && strings.HasSuffix(request.URL.Path, "/instances"):
-		name := strings.TrimSuffix(strings.TrimPrefix(request.URL.Path, WorkflowInstancesPath), "/instances")
-		var input StartWorkflowRequest
-		if !decodeJSON(response, request, &input) {
-			return
-		}
-		key := request.Header.Get("Idempotency-Key")
-		var instance *domain.WorkflowInstance
-		var err error
-		if len(request.Header.Values("Idempotency-Key")) > 0 {
-			if strings.TrimSpace(key) == "" {
-				writeError(response, http.StatusBadRequest, "Idempotency-Key must not be empty")
-				return
-			}
-			instance, err = gateway.StartWorkflowIdempotent(ctx, name, input.Version, input.Context, key)
-		} else {
-			instance, err = gateway.StartWorkflow(ctx, name, input.Version, input.Context)
-		}
-		var runID string
-		if instance != nil {
-			runID = instance.ID
-		}
-		writeResult(response, map[string]string{"id": runID}, err)
+		gateway.serveStartWorkflow(ctx, response, request)
 	default:
 		writeError(response, http.StatusNotFound, "route not found")
 	}
+}
+
+func (gateway *Gateway) serveReceiveWork(ctx context.Context, response http.ResponseWriter, request *http.Request) {
+	var input ReceiveWorkRequest
+	if !decodeJSON(response, request, &input) {
+		return
+	}
+	leaseDuration := 30 * time.Second
+	if input.LeaseDurationMS > 0 {
+		leaseDuration = time.Duration(input.LeaseDurationMS) * time.Millisecond
+	}
+	output, err := gateway.ReceiveWork(ctx, input.WorkerID, leaseDuration)
+	writeResult(response, output, err)
+}
+
+func (gateway *Gateway) serveTaskComplete(ctx context.Context, response http.ResponseWriter, request *http.Request) {
+	var input TaskCompletion
+	if !decodeJSON(response, request, &input) {
+		return
+	}
+	writeResult(response, map[string]string{"status": "completed"}, gateway.CompleteWork(ctx, input))
+}
+
+func (gateway *Gateway) serveTaskHeartbeat(ctx context.Context, response http.ResponseWriter, request *http.Request) {
+	var input TaskHeartbeat
+	if !decodeJSON(response, request, &input) {
+		return
+	}
+	writeResult(response, map[string]string{"status": "renewed"}, gateway.HeartbeatWork(ctx, input))
+}
+
+func (gateway *Gateway) serveTaskFail(ctx context.Context, response http.ResponseWriter, request *http.Request) {
+	var input TaskFailure
+	if !decodeJSON(response, request, &input) {
+		return
+	}
+	writeResult(response, map[string]string{"status": "failed"}, gateway.FailWork(ctx, input))
+}
+
+func (gateway *Gateway) serveStartWorkflow(ctx context.Context, response http.ResponseWriter, request *http.Request) {
+	name := strings.TrimSuffix(strings.TrimPrefix(request.URL.Path, WorkflowInstancesPath), "/instances")
+	var input StartWorkflowRequest
+	if !decodeJSON(response, request, &input) {
+		return
+	}
+	key := request.Header.Get("Idempotency-Key")
+	var instance *domain.WorkflowInstance
+	var err error
+	if len(request.Header.Values("Idempotency-Key")) > 0 {
+		if strings.TrimSpace(key) == "" {
+			writeError(response, http.StatusBadRequest, "Idempotency-Key must not be empty")
+			return
+		}
+		instance, err = gateway.StartWorkflowIdempotent(ctx, name, input.Version, input.Context, key)
+	} else {
+		instance, err = gateway.StartWorkflow(ctx, name, input.Version, input.Context)
+	}
+	var runID string
+	if instance != nil {
+		runID = instance.ID
+	}
+	writeResult(response, map[string]string{"id": runID}, err)
 }
 
 func (gateway *Gateway) serveGET(response http.ResponseWriter, request *http.Request) {
@@ -814,53 +857,60 @@ func (gateway *Gateway) serveGET(response http.ResponseWriter, request *http.Req
 		metrics, err := gateway.WorkflowMetrics(request.Context())
 		writeResult(response, metrics, err)
 	case path == "/v1/workflows":
-		workflows, err := gateway.ListWorkflows(request.Context())
-		if err != nil {
-			slog.Error("workflow catalog listing failed", "error", err)
-			err = errWorkflowCatalogUnavailable
-		}
-		writeResult(response, workflows, err)
+		gateway.serveWorkflowCatalog(response, request)
 	case strings.HasPrefix(path, WorkflowInstancesPath) && strings.HasSuffix(path, "/contracts"):
 		gateway.serveContracts(response, request)
 	case path == "/v1/instances":
-		limit, limitErr := parseQueryInt(request, "limit", 25)
-		offset, offsetErr := parseQueryInt(request, "offset", 0)
-		if limitErr != nil || offsetErr != nil {
-			writeError(response, http.StatusBadRequest, "limit and offset must be integers")
-			return
-		}
-		page, err := gateway.ListWorkflowRuns(request.Context(), request.URL.Query().Get("workflow_name"), domain.WorkflowStatus(request.URL.Query().Get("status")), limit, offset)
-		writeResult(response, page, err)
+		gateway.serveWorkflowRunPage(response, request, request.URL.Query().Get("workflow_name"))
 	case strings.HasPrefix(path, WorkflowInstancesPath) && strings.HasSuffix(path, "/instances"):
 		name := strings.TrimSuffix(strings.TrimPrefix(path, WorkflowInstancesPath), "/instances")
-		limit, limitErr := parseQueryInt(request, "limit", 25)
-		offset, offsetErr := parseQueryInt(request, "offset", 0)
-		if limitErr != nil || offsetErr != nil {
-			writeError(response, http.StatusBadRequest, "limit and offset must be integers")
-			return
-		}
-		page, err := gateway.ListWorkflowRuns(request.Context(), name, domain.WorkflowStatus(request.URL.Query().Get("status")), limit, offset)
-		writeResult(response, page, err)
+		gateway.serveWorkflowRunPage(response, request, name)
 	case strings.HasPrefix(path, WorkflowInstancesPath):
-		name := strings.TrimPrefix(path, WorkflowInstancesPath)
-		version, err := parseQueryInt(request, "version", 0)
-		if err != nil || version < 0 {
-			writeError(response, http.StatusBadRequest, "version must be a non-negative integer")
-			return
-		}
-		definition, err := gateway.definition(request.Context(), name, version)
-		writeResult(response, definition, err)
+		gateway.serveWorkflowDefinition(response, request, strings.TrimPrefix(path, WorkflowInstancesPath))
 	case strings.HasPrefix(path, "/v1/instances/"):
-		workflowID := strings.TrimPrefix(path, "/v1/instances/")
-		if workflowID == "" || strings.Contains(workflowID, "/") {
-			writeError(response, http.StatusNotFound, "route not found")
-			return
-		}
-		detail, err := gateway.WorkflowRun(request.Context(), workflowID)
-		writeResult(response, detail, err)
+		gateway.serveWorkflowRunDetail(response, request, strings.TrimPrefix(path, "/v1/instances/"))
 	default:
 		writeError(response, http.StatusNotFound, "route not found")
 	}
+}
+
+func (gateway *Gateway) serveWorkflowCatalog(response http.ResponseWriter, request *http.Request) {
+	workflows, err := gateway.ListWorkflows(request.Context())
+	if err != nil {
+		slog.Error("workflow catalog listing failed", "error", err)
+		err = errWorkflowCatalogUnavailable
+	}
+	writeResult(response, workflows, err)
+}
+
+func (gateway *Gateway) serveWorkflowRunPage(response http.ResponseWriter, request *http.Request, workflowName string) {
+	limit, limitErr := parseQueryInt(request, "limit", 25)
+	offset, offsetErr := parseQueryInt(request, "offset", 0)
+	if limitErr != nil || offsetErr != nil {
+		writeError(response, http.StatusBadRequest, "limit and offset must be integers")
+		return
+	}
+	page, err := gateway.ListWorkflowRuns(request.Context(), workflowName, domain.WorkflowStatus(request.URL.Query().Get("status")), limit, offset)
+	writeResult(response, page, err)
+}
+
+func (gateway *Gateway) serveWorkflowDefinition(response http.ResponseWriter, request *http.Request, name string) {
+	version, err := parseQueryInt(request, "version", 0)
+	if err != nil || version < 0 {
+		writeError(response, http.StatusBadRequest, "version must be a non-negative integer")
+		return
+	}
+	definition, err := gateway.definition(request.Context(), name, version)
+	writeResult(response, definition, err)
+}
+
+func (gateway *Gateway) serveWorkflowRunDetail(response http.ResponseWriter, request *http.Request, workflowID string) {
+	if workflowID == "" || strings.Contains(workflowID, "/") {
+		writeError(response, http.StatusNotFound, "route not found")
+		return
+	}
+	detail, err := gateway.WorkflowRun(request.Context(), workflowID)
+	writeResult(response, detail, err)
 }
 
 func parseQueryInt(request *http.Request, key string, defaultValue int) (int, error) {

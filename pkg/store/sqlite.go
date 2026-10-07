@@ -102,88 +102,87 @@ func (store *SQLiteStore) Migrate(ctx context.Context) error {
 		return fmt.Errorf("begin SQLite migration: %w", err)
 	}
 	defer transaction.Rollback()
-	if _, err := transaction.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
-		version INTEGER PRIMARY KEY,
-		applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-	)`); err != nil {
-		return fmt.Errorf("create SQLite migration table: %w", err)
+	if err := ensureSQLiteMigrationsTable(ctx, transaction); err != nil {
+		return err
 	}
-	var applied bool
-	if err := transaction.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = 1)`).Scan(&applied); err != nil {
-		return fmt.Errorf("check SQLite migration version: %w", err)
+	if err := migrateSQLiteInitial(ctx, transaction); err != nil {
+		return err
 	}
-	if !applied {
-		migration, err := sqliteMigration.ReadFile("migrations/0001_sqlite.sql")
-		if err != nil {
-			return fmt.Errorf("read SQLite migration: %w", err)
-		}
-		if _, err := transaction.ExecContext(ctx, string(migration)); err != nil {
-			return fmt.Errorf("apply SQLite migration: %w", err)
-		}
-		if _, err := transaction.ExecContext(ctx, `INSERT INTO schema_migrations (version) VALUES (1) ON CONFLICT DO NOTHING`); err != nil {
-			return fmt.Errorf("record SQLite migration: %w", err)
-		}
+	if err := applySQLiteVersionedMigration(ctx, transaction, 2, sqliteOutboxMigration, "outbox"); err != nil {
+		return err
 	}
-	if err := transaction.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = 2)`).Scan(&applied); err != nil {
-		return fmt.Errorf("check SQLite outbox migration version: %w", err)
+	if err := applySQLiteVersionedMigration(ctx, transaction, 3, sqliteIdempotencyMigration, "idempotency"); err != nil {
+		return err
 	}
-	if !applied {
-		if _, err := transaction.ExecContext(ctx, string(sqliteOutboxMigration)); err != nil {
-			return fmt.Errorf("apply SQLite outbox migration: %w", err)
-		}
-		if _, err := transaction.ExecContext(ctx, `INSERT INTO schema_migrations (version) VALUES (2) ON CONFLICT DO NOTHING`); err != nil {
-			return fmt.Errorf("record SQLite outbox migration: %w", err)
-		}
+	if err := applySQLiteVersionedMigration(ctx, transaction, 4, sqliteTaskPublicationMigration, "task publication"); err != nil {
+		return err
 	}
-	if err := transaction.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = 3)`).Scan(&applied); err != nil {
-		return fmt.Errorf("check SQLite idempotency migration version: %w", err)
+	if err := applySQLiteVersionedMigration(ctx, transaction, 5, sqliteTaskLeaseMigration, "task lease"); err != nil {
+		return err
 	}
-	if !applied {
-		if _, err := transaction.ExecContext(ctx, string(sqliteIdempotencyMigration)); err != nil {
-			return fmt.Errorf("apply SQLite idempotency migration: %w", err)
-		}
-		if _, err := transaction.ExecContext(ctx, `INSERT INTO schema_migrations (version) VALUES (3) ON CONFLICT DO NOTHING`); err != nil {
-			return fmt.Errorf("record SQLite idempotency migration: %w", err)
-		}
-	}
-	if err := transaction.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = 4)`).Scan(&applied); err != nil {
-		return fmt.Errorf("check SQLite task publication migration version: %w", err)
-	}
-	if !applied {
-		if _, err := transaction.ExecContext(ctx, string(sqliteTaskPublicationMigration)); err != nil {
-			return fmt.Errorf("apply SQLite task publication migration: %w", err)
-		}
-		if _, err := transaction.ExecContext(ctx, `INSERT INTO schema_migrations (version) VALUES (4) ON CONFLICT DO NOTHING`); err != nil {
-			return fmt.Errorf("record SQLite task publication migration: %w", err)
-		}
-	}
-	if err := transaction.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = 5)`).Scan(&applied); err != nil {
-		return fmt.Errorf("check SQLite task lease migration version: %w", err)
-	}
-	if !applied {
-		if _, err := transaction.ExecContext(ctx, string(sqliteTaskLeaseMigration)); err != nil {
-			return fmt.Errorf("apply SQLite task lease migration: %w", err)
-		}
-		if _, err := transaction.ExecContext(ctx, `INSERT INTO schema_migrations (version) VALUES (5) ON CONFLICT DO NOTHING`); err != nil {
-			return fmt.Errorf("record SQLite task lease migration: %w", err)
-		}
-	}
-	if err := transaction.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = 6)`).Scan(&applied); err != nil {
-		return fmt.Errorf("check SQLite retention migration version: %w", err)
-	}
-	if !applied {
-		if _, err := transaction.ExecContext(ctx, string(sqliteRetentionMigration)); err != nil {
-			return fmt.Errorf("apply SQLite retention migration: %w", err)
-		}
-		if _, err := transaction.ExecContext(ctx, `INSERT INTO schema_migrations (version) VALUES (6) ON CONFLICT DO NOTHING`); err != nil {
-			return fmt.Errorf("record SQLite retention migration: %w", err)
-		}
+	if err := applySQLiteVersionedMigration(ctx, transaction, 6, sqliteRetentionMigration, "retention"); err != nil {
+		return err
 	}
 	if err := applyPortalRegistryMigration(ctx, transaction, sqlitePortalRegistryMigration); err != nil {
 		return err
 	}
 	if err := transaction.Commit(); err != nil {
 		return fmt.Errorf("commit SQLite migration: %w", err)
+	}
+	return nil
+}
+
+// ensureSQLiteMigrationsTable creates the schema_migrations tracking table if it doesn't exist yet.
+func ensureSQLiteMigrationsTable(ctx context.Context, transaction *sql.Tx) error {
+	if _, err := transaction.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
+		version INTEGER PRIMARY KEY,
+		applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+	)`); err != nil {
+		return fmt.Errorf("create SQLite migration table: %w", err)
+	}
+	return nil
+}
+
+// migrateSQLiteInitial applies the version 1 (initial schema) migration, which is read from an
+// embedded file rather than an in-memory byte slice like the later versioned migrations.
+func migrateSQLiteInitial(ctx context.Context, transaction *sql.Tx) error {
+	var applied bool
+	if err := transaction.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = 1)`).Scan(&applied); err != nil {
+		return fmt.Errorf("check SQLite migration version: %w", err)
+	}
+	if applied {
+		return nil
+	}
+	migration, err := sqliteMigration.ReadFile("migrations/0001_sqlite.sql")
+	if err != nil {
+		return fmt.Errorf("read SQLite migration: %w", err)
+	}
+	if _, err := transaction.ExecContext(ctx, string(migration)); err != nil {
+		return fmt.Errorf("apply SQLite migration: %w", err)
+	}
+	if _, err := transaction.ExecContext(ctx, `INSERT INTO schema_migrations (version) VALUES (1) ON CONFLICT DO NOTHING`); err != nil {
+		return fmt.Errorf("record SQLite migration: %w", err)
+	}
+	return nil
+}
+
+// applySQLiteVersionedMigration applies a single numbered migration step if it hasn't been
+// recorded in schema_migrations yet, wrapping errors with the given human-readable label.
+func applySQLiteVersionedMigration(ctx context.Context, transaction *sql.Tx, version int, migration []byte, label string) error {
+	var applied bool
+	checkQuery := fmt.Sprintf(`SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = %d)`, version)
+	if err := transaction.QueryRowContext(ctx, checkQuery).Scan(&applied); err != nil {
+		return fmt.Errorf("check SQLite %s migration version: %w", label, err)
+	}
+	if applied {
+		return nil
+	}
+	if _, err := transaction.ExecContext(ctx, string(migration)); err != nil {
+		return fmt.Errorf("apply SQLite %s migration: %w", label, err)
+	}
+	insertQuery := fmt.Sprintf(`INSERT INTO schema_migrations (version) VALUES (%d) ON CONFLICT DO NOTHING`, version)
+	if _, err := transaction.ExecContext(ctx, insertQuery); err != nil {
+		return fmt.Errorf("record SQLite %s migration: %w", label, err)
 	}
 	return nil
 }
@@ -249,6 +248,33 @@ func (store *SQLiteStore) CreateIdempotent(ctx context.Context, instance *domain
 }
 
 func createSQLiteExecution(ctx context.Context, transaction *sql.Tx, instance *domain.WorkflowInstance) error {
+	if err := validateSQLiteNewExecution(instance); err != nil {
+		return err
+	}
+	definition, snapshot, workflowContext, err := marshalSQLiteExecutionPayload(instance)
+	if err != nil {
+		return err
+	}
+	if err := upsertSQLiteWorkflowDefinition(ctx, transaction, instance, definition); err != nil {
+		return err
+	}
+	inserted, err := insertSQLiteWorkflowExecution(ctx, transaction, instance, workflowContext, snapshot)
+	if err != nil {
+		return err
+	}
+	if !inserted {
+		return ErrAlreadyExists
+	}
+	for _, event := range instance.Events {
+		if err := insertSQLiteWorkflowEvent(ctx, transaction, event); err != nil {
+			return err
+		}
+	}
+	return syncSQLiteTasks(ctx, transaction, instance)
+}
+
+// validateSQLiteNewExecution checks the required preconditions for creating a new workflow execution.
+func validateSQLiteNewExecution(instance *domain.WorkflowInstance) error {
 	if instance == nil {
 		return fmt.Errorf("workflow instance is required")
 	}
@@ -258,18 +284,30 @@ func createSQLiteExecution(ctx context.Context, transaction *sql.Tx, instance *d
 	if err := instance.Definition.Validate(); err != nil {
 		return fmt.Errorf("validate workflow definition: %w", err)
 	}
-	definition, err := json.Marshal(instance.Definition)
+	return nil
+}
+
+// marshalSQLiteExecutionPayload encodes the definition, snapshot, and context JSON payloads
+// needed to persist a new workflow execution.
+func marshalSQLiteExecutionPayload(instance *domain.WorkflowInstance) (definition, snapshot, workflowContext []byte, err error) {
+	definition, err = json.Marshal(instance.Definition)
 	if err != nil {
-		return fmt.Errorf("encode workflow definition: %w", err)
+		return nil, nil, nil, fmt.Errorf("encode workflow definition: %w", err)
 	}
-	snapshot, err := json.Marshal(instance)
+	snapshot, err = json.Marshal(instance)
 	if err != nil {
-		return fmt.Errorf("encode workflow snapshot: %w", err)
+		return nil, nil, nil, fmt.Errorf("encode workflow snapshot: %w", err)
 	}
-	workflowContext, err := json.Marshal(instance.Context)
+	workflowContext, err = json.Marshal(instance.Context)
 	if err != nil {
-		return fmt.Errorf("encode workflow context: %w", err)
+		return nil, nil, nil, fmt.Errorf("encode workflow context: %w", err)
 	}
+	return definition, snapshot, workflowContext, nil
+}
+
+// upsertSQLiteWorkflowDefinition inserts the workflow definition if absent, then verifies that
+// the stored definition matches the one being created, returning ErrDefinitionConflict otherwise.
+func upsertSQLiteWorkflowDefinition(ctx context.Context, transaction *sql.Tx, instance *domain.WorkflowInstance, definition []byte) error {
 	if _, err := transaction.ExecContext(ctx, `INSERT INTO workflow_definitions (workflow_name, version, definition)
 		VALUES (?, ?, ?) ON CONFLICT (workflow_name, version) DO NOTHING`, instance.Definition.Name, instance.Definition.Version, string(definition)); err != nil {
 		return fmt.Errorf("insert SQLite workflow definition: %w", err)
@@ -285,29 +323,24 @@ func createSQLiteExecution(ctx context.Context, transaction *sql.Tx, instance *d
 	if !reflect.DeepEqual(storedDefinition, instance.Definition) {
 		return ErrDefinitionConflict
 	}
+	return nil
+}
+
+// insertSQLiteWorkflowExecution inserts the workflow execution row, reporting whether a new row
+// was actually inserted (false means a row with the same ID already existed).
+func insertSQLiteWorkflowExecution(ctx context.Context, transaction *sql.Tx, instance *domain.WorkflowInstance, workflowContext, snapshot []byte) (bool, error) {
 	result, err := transaction.ExecContext(ctx, `INSERT INTO workflow_executions
 		(id, workflow_name, definition_version, status, context, snapshot)
 		VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING`,
 		instance.ID, instance.Definition.Name, instance.Definition.Version, instance.Status, string(workflowContext), string(snapshot))
 	if err != nil {
-		return fmt.Errorf("insert SQLite workflow execution: %w", err)
+		return false, fmt.Errorf("insert SQLite workflow execution: %w", err)
 	}
 	inserted, err := result.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("check SQLite workflow insertion: %w", err)
+		return false, fmt.Errorf("check SQLite workflow insertion: %w", err)
 	}
-	if inserted == 0 {
-		return ErrAlreadyExists
-	}
-	for _, event := range instance.Events {
-		if err := insertSQLiteWorkflowEvent(ctx, transaction, event); err != nil {
-			return err
-		}
-	}
-	if err := syncSQLiteTasks(ctx, transaction, instance); err != nil {
-		return err
-	}
-	return nil
+	return inserted != 0, nil
 }
 
 func (store *SQLiteStore) Get(workflowID string) (*domain.WorkflowInstance, error) {
@@ -446,17 +479,9 @@ func appendSQLiteEvents(ctx context.Context, transaction *sql.Tx, workflowID str
 	if workflowID == "" || len(events) == 0 {
 		return fmt.Errorf("workflow ID and at least one workflow event are required")
 	}
-	var snapshot string
-	var version int64
-	if err := transaction.QueryRowContext(ctx, `SELECT snapshot, version FROM workflow_executions WHERE id = ?`, workflowID).Scan(&snapshot, &version); err != nil {
-		if err == sql.ErrNoRows {
-			return fmt.Errorf("%w: %s", ErrNotFound, workflowID)
-		}
-		return fmt.Errorf("read SQLite workflow snapshot for append: %w", err)
-	}
-	var instance domain.WorkflowInstance
-	if err := json.Unmarshal([]byte(snapshot), &instance); err != nil {
-		return fmt.Errorf("decode SQLite workflow snapshot for append: %w", err)
+	instance, version, err := loadSQLiteExecutionForAppend(ctx, transaction, workflowID)
+	if err != nil {
+		return err
 	}
 	firstNewEvent := len(instance.Events)
 	for _, event := range events {
@@ -464,7 +489,39 @@ func appendSQLiteEvents(ctx context.Context, transaction *sql.Tx, workflowID str
 			return err
 		}
 	}
-	snapshotBytes, err := json.Marshal(&instance)
+	if err := saveSQLiteExecutionSnapshot(ctx, transaction, workflowID, version, &instance); err != nil {
+		return err
+	}
+	for _, event := range instance.Events[firstNewEvent:] {
+		if err := insertSQLiteWorkflowEvent(ctx, transaction, event); err != nil {
+			return err
+		}
+	}
+	return syncSQLiteTasks(ctx, transaction, &instance)
+}
+
+// loadSQLiteExecutionForAppend reads and decodes the current snapshot and version of a workflow
+// execution so new events can be appended to it.
+func loadSQLiteExecutionForAppend(ctx context.Context, transaction *sql.Tx, workflowID string) (domain.WorkflowInstance, int64, error) {
+	var snapshot string
+	var version int64
+	if err := transaction.QueryRowContext(ctx, `SELECT snapshot, version FROM workflow_executions WHERE id = ?`, workflowID).Scan(&snapshot, &version); err != nil {
+		if err == sql.ErrNoRows {
+			return domain.WorkflowInstance{}, 0, fmt.Errorf("%w: %s", ErrNotFound, workflowID)
+		}
+		return domain.WorkflowInstance{}, 0, fmt.Errorf("read SQLite workflow snapshot for append: %w", err)
+	}
+	var instance domain.WorkflowInstance
+	if err := json.Unmarshal([]byte(snapshot), &instance); err != nil {
+		return domain.WorkflowInstance{}, 0, fmt.Errorf("decode SQLite workflow snapshot for append: %w", err)
+	}
+	return instance, version, nil
+}
+
+// saveSQLiteExecutionSnapshot persists the updated snapshot with an optimistic version check,
+// returning ErrConflict if the version has moved on since it was loaded.
+func saveSQLiteExecutionSnapshot(ctx context.Context, transaction *sql.Tx, workflowID string, version int64, instance *domain.WorkflowInstance) error {
+	snapshotBytes, err := json.Marshal(instance)
 	if err != nil {
 		return fmt.Errorf("encode SQLite workflow snapshot: %w", err)
 	}
@@ -484,14 +541,6 @@ func appendSQLiteEvents(ctx context.Context, transaction *sql.Tx, workflowID str
 	}
 	if updated == 0 {
 		return ErrConflict
-	}
-	for _, event := range instance.Events[firstNewEvent:] {
-		if err := insertSQLiteWorkflowEvent(ctx, transaction, event); err != nil {
-			return err
-		}
-	}
-	if err := syncSQLiteTasks(ctx, transaction, &instance); err != nil {
-		return err
 	}
 	return nil
 }

@@ -117,87 +117,119 @@ func validateNodes(nodes []ast.Node, tasks map[string]ast.TaskDecl, types map[st
 	for _, node := range nodes {
 		switch typed := node.(type) {
 		case ast.StepNode:
-			if err := validateCall(typed.Call, tasks, types); err != nil {
+			if err := validateStepNode(typed, tasks, types, stepOutputs); err != nil {
 				return err
-			}
-			if task, ok := tasks[typed.Call.Name]; ok {
-				stepOutputs[typed.Name] = task.Output
-			}
-			if typed.Compensation != nil {
-				if err := validateCall(*typed.Compensation, tasks, types); err != nil {
-					return err
-				}
 			}
 		case ast.IfNode:
-			thenOutputs := copyStepOutputs(stepOutputs)
-			elseOutputs := copyStepOutputs(stepOutputs)
-			if err := validateNodes(typed.Then, tasks, types, outputType, inputType, thenOutputs, returnAllowed); err != nil {
+			if err := validateIfNode(typed, tasks, types, outputType, inputType, stepOutputs, returnAllowed); err != nil {
 				return err
-			}
-			if err := validateNodes(typed.Else, tasks, types, outputType, inputType, elseOutputs, returnAllowed); err != nil {
-				return err
-			}
-			thenFallsThrough := sequenceCanSucceedWithoutReturn(typed.Then)
-			elseFallsThrough := len(typed.Else) == 0 || sequenceCanSucceedWithoutReturn(typed.Else)
-			switch {
-			case thenFallsThrough && !elseFallsThrough:
-				replaceStepOutputs(stepOutputs, thenOutputs)
-			case elseFallsThrough && !thenFallsThrough:
-				replaceStepOutputs(stepOutputs, elseOutputs)
-			default:
-				for name, typeName := range thenOutputs {
-					if elseOutputs[name] != typeName {
-						delete(thenOutputs, name)
-					}
-				}
-				replaceStepOutputs(stepOutputs, thenOutputs)
 			}
 		case ast.ForkNode:
-			mergedOutputs := copyStepOutputs(stepOutputs)
-			for _, branch := range typed.Branches {
-				branchOutputs := copyStepOutputs(stepOutputs)
-				if err := validateNodes(branch, tasks, types, outputType, inputType, branchOutputs, false); err != nil {
-					return err
-				}
-				for name, typeName := range branchOutputs {
-					mergedOutputs[name] = typeName
-				}
+			if err := validateForkNode(typed, tasks, types, outputType, inputType, stepOutputs); err != nil {
+				return err
 			}
-			replaceStepOutputs(stepOutputs, mergedOutputs)
 		case ast.FanOutNode:
-			bodyOutputs := copyStepOutputs(stepOutputs)
-			if err := validateNodes(typed.Body, tasks, types, outputType, inputType, bodyOutputs, false); err != nil {
+			if err := validateFanOutNode(typed, tasks, types, outputType, inputType, stepOutputs); err != nil {
 				return err
 			}
 		case ast.ReturnNode:
-			if !returnAllowed {
-				return fmt.Errorf("workflow return cannot appear inside a fork or fan_out block")
+			if err := validateReturnNode(typed, types, outputType, inputType, stepOutputs, returnAllowed); err != nil {
+				return err
 			}
-			if typed.Type != outputType {
-				return fmt.Errorf("workflow return type %q does not match declared output %q", typed.Type, outputType)
+		}
+	}
+	return nil
+}
+
+func validateStepNode(step ast.StepNode, tasks map[string]ast.TaskDecl, types map[string]map[string]string, stepOutputs map[string]string) error {
+	if err := validateCall(step.Call, tasks, types); err != nil {
+		return err
+	}
+	if task, ok := tasks[step.Call.Name]; ok {
+		stepOutputs[step.Name] = task.Output
+	}
+	if step.Compensation != nil {
+		if err := validateCall(*step.Compensation, tasks, types); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateIfNode(ifNode ast.IfNode, tasks map[string]ast.TaskDecl, types map[string]map[string]string, outputType, inputType string, stepOutputs map[string]string, returnAllowed bool) error {
+	thenOutputs := copyStepOutputs(stepOutputs)
+	elseOutputs := copyStepOutputs(stepOutputs)
+	if err := validateNodes(ifNode.Then, tasks, types, outputType, inputType, thenOutputs, returnAllowed); err != nil {
+		return err
+	}
+	if err := validateNodes(ifNode.Else, tasks, types, outputType, inputType, elseOutputs, returnAllowed); err != nil {
+		return err
+	}
+	thenFallsThrough := sequenceCanSucceedWithoutReturn(ifNode.Then)
+	elseFallsThrough := len(ifNode.Else) == 0 || sequenceCanSucceedWithoutReturn(ifNode.Else)
+	switch {
+	case thenFallsThrough && !elseFallsThrough:
+		replaceStepOutputs(stepOutputs, thenOutputs)
+	case elseFallsThrough && !thenFallsThrough:
+		replaceStepOutputs(stepOutputs, elseOutputs)
+	default:
+		for name, typeName := range thenOutputs {
+			if elseOutputs[name] != typeName {
+				delete(thenOutputs, name)
 			}
-			outputFields := types[outputType]
-			seen := make(map[string]bool, len(typed.Fields))
-			for _, field := range typed.Fields {
-				if field.Name == "" || field.Value == nil {
-					return fmt.Errorf("return field %q is incomplete", field.Name)
-				}
-				if seen[field.Name] {
-					return fmt.Errorf("workflow return has duplicate field %q", field.Name)
-				}
-				if _, exists := outputFields[field.Name]; !exists {
-					return fmt.Errorf("workflow output %q has no field %q", outputType, field.Name)
-				}
-				if err := validateReturnValueType(field.Value, outputFields[field.Name], types, inputType, stepOutputs); err != nil {
-					return fmt.Errorf("workflow return field %q: %w", field.Name, err)
-				}
-				seen[field.Name] = true
-			}
-			for fieldName := range outputFields {
-				if !seen[fieldName] {
-					return fmt.Errorf("workflow return is missing output field %q", fieldName)
-				}
-			}
+		}
+		replaceStepOutputs(stepOutputs, thenOutputs)
+	}
+	return nil
+}
+
+func validateForkNode(forkNode ast.ForkNode, tasks map[string]ast.TaskDecl, types map[string]map[string]string, outputType, inputType string, stepOutputs map[string]string) error {
+	mergedOutputs := copyStepOutputs(stepOutputs)
+	for _, branch := range forkNode.Branches {
+		branchOutputs := copyStepOutputs(stepOutputs)
+		if err := validateNodes(branch, tasks, types, outputType, inputType, branchOutputs, false); err != nil {
+			return err
+		}
+		for name, typeName := range branchOutputs {
+			mergedOutputs[name] = typeName
+		}
+	}
+	replaceStepOutputs(stepOutputs, mergedOutputs)
+	return nil
+}
+
+func validateFanOutNode(fanOut ast.FanOutNode, tasks map[string]ast.TaskDecl, types map[string]map[string]string, outputType, inputType string, stepOutputs map[string]string) error {
+	bodyOutputs := copyStepOutputs(stepOutputs)
+	return validateNodes(fanOut.Body, tasks, types, outputType, inputType, bodyOutputs, false)
+}
+
+func validateReturnNode(returnNode ast.ReturnNode, types map[string]map[string]string, outputType, inputType string, stepOutputs map[string]string, returnAllowed bool) error {
+	if !returnAllowed {
+		return fmt.Errorf("workflow return cannot appear inside a fork or fan_out block")
+	}
+	if returnNode.Type != outputType {
+		return fmt.Errorf("workflow return type %q does not match declared output %q", returnNode.Type, outputType)
+	}
+	outputFields := types[outputType]
+	seen := make(map[string]bool, len(returnNode.Fields))
+	for _, field := range returnNode.Fields {
+		if field.Name == "" || field.Value == nil {
+			return fmt.Errorf("return field %q is incomplete", field.Name)
+		}
+		if seen[field.Name] {
+			return fmt.Errorf("workflow return has duplicate field %q", field.Name)
+		}
+		if _, exists := outputFields[field.Name]; !exists {
+			return fmt.Errorf("workflow output %q has no field %q", outputType, field.Name)
+		}
+		if err := validateReturnValueType(field.Value, outputFields[field.Name], types, inputType, stepOutputs); err != nil {
+			return fmt.Errorf("workflow return field %q: %w", field.Name, err)
+		}
+		seen[field.Name] = true
+	}
+	for fieldName := range outputFields {
+		if !seen[fieldName] {
+			return fmt.Errorf("workflow return is missing output field %q", fieldName)
 		}
 	}
 	return nil
@@ -288,55 +320,63 @@ func inferReturnValueType(expression ast.Expression, types map[string]map[string
 		}
 		return "bool", nil
 	case ast.MemberExpr:
-		path, ok := expressionPath(typed)
-		if !ok || len(path) < 2 {
-			return "", fmt.Errorf("unsupported return member expression")
-		}
-		currentType := ""
-		fields := path[1:]
-		if path[0] == "input" {
-			currentType = inputType
-		} else if outputType, exists := stepOutputs[path[0]]; exists && path[1] == "result" {
-			currentType = outputType
-			fields = path[2:]
-		} else {
-			return "", fmt.Errorf("unresolved return path %q", strings.Join(path, "."))
-		}
-		for _, fieldName := range fields {
-			fieldType, exists := types[currentType][fieldName]
-			if !exists {
-				return "", fmt.Errorf("type %q has no field %q in return path %q", currentType, fieldName, strings.Join(path, "."))
-			}
-			currentType = fieldType
-		}
-		return currentType, nil
+		return inferMemberReturnType(typed, types, inputType, stepOutputs)
 	case ast.BinaryExpr:
-		leftType, err := inferReturnValueType(typed.Left, types, inputType, stepOutputs)
-		if err != nil {
-			return "", err
-		}
-		rightType, err := inferReturnValueType(typed.Right, types, inputType, stepOutputs)
-		if err != nil {
-			return "", err
-		}
-		switch typed.Operator {
-		case "&&", "||":
-			if leftType != "bool" || rightType != "bool" {
-				return "", fmt.Errorf("operator %s requires bool operands, got %q and %q", typed.Operator, leftType, rightType)
-			}
-		case "==", "!=":
-			return "bool", nil
-		case ">", ">=", "<", "<=":
-			if !orderedReturnTypesCompatible(leftType, rightType) {
-				return "", fmt.Errorf("operator %s cannot compare %q and %q", typed.Operator, leftType, rightType)
-			}
-		default:
-			return "", fmt.Errorf("unsupported binary return operator %q", typed.Operator)
-		}
-		return "bool", nil
+		return inferBinaryReturnType(typed, types, inputType, stepOutputs)
 	default:
 		return "", fmt.Errorf("unsupported return expression %T", expression)
 	}
+}
+
+func inferMemberReturnType(member ast.MemberExpr, types map[string]map[string]string, inputType string, stepOutputs map[string]string) (string, error) {
+	path, ok := expressionPath(member)
+	if !ok || len(path) < 2 {
+		return "", fmt.Errorf("unsupported return member expression")
+	}
+	currentType := ""
+	fields := path[1:]
+	if path[0] == "input" {
+		currentType = inputType
+	} else if outputType, exists := stepOutputs[path[0]]; exists && path[1] == "result" {
+		currentType = outputType
+		fields = path[2:]
+	} else {
+		return "", fmt.Errorf("unresolved return path %q", strings.Join(path, "."))
+	}
+	for _, fieldName := range fields {
+		fieldType, exists := types[currentType][fieldName]
+		if !exists {
+			return "", fmt.Errorf("type %q has no field %q in return path %q", currentType, fieldName, strings.Join(path, "."))
+		}
+		currentType = fieldType
+	}
+	return currentType, nil
+}
+
+func inferBinaryReturnType(binary ast.BinaryExpr, types map[string]map[string]string, inputType string, stepOutputs map[string]string) (string, error) {
+	leftType, err := inferReturnValueType(binary.Left, types, inputType, stepOutputs)
+	if err != nil {
+		return "", err
+	}
+	rightType, err := inferReturnValueType(binary.Right, types, inputType, stepOutputs)
+	if err != nil {
+		return "", err
+	}
+	switch binary.Operator {
+	case "&&", "||":
+		if leftType != "bool" || rightType != "bool" {
+			return "", fmt.Errorf("operator %s requires bool operands, got %q and %q", binary.Operator, leftType, rightType)
+		}
+	case "==", "!=":
+		return "bool", nil
+	case ">", ">=", "<", "<=":
+		if !orderedReturnTypesCompatible(leftType, rightType) {
+			return "", fmt.Errorf("operator %s cannot compare %q and %q", binary.Operator, leftType, rightType)
+		}
+	default:
+		return "", fmt.Errorf("unsupported binary return operator %q", binary.Operator)
+	}
+	return "bool", nil
 }
 
 func orderedReturnTypesCompatible(left, right string) bool {

@@ -56,32 +56,7 @@ func (session *rabbitSession) supervise() {
 		if err != nil {
 			return
 		}
-		channel, err := connection.Channel()
-		if err == nil {
-			err = declareRabbitTopology(channel, session.queueName)
-		}
-		if err == nil {
-			err = channel.Confirm(false)
-		}
-		if err == nil {
-			err = channel.Qos(rabbitPrefetch, 0, false)
-		}
-		// Establish consumers while holding session.mu so a concurrent consumer()
-		// call cannot write to session.consumers while install() replaces the map.
-		// channel.Consume does not acquire session.mu, so this is safe.
-		consumers := make(map[string]<-chan amqp.Delivery)
-		if err == nil {
-			session.mu.Lock()
-			for consumerID := range session.desiredConsumers {
-				consumer, consumeErr := channel.Consume(session.queueName, consumerID, false, false, false, false, nil)
-				if consumeErr != nil {
-					err = consumeErr
-					break
-				}
-				consumers[consumerID] = consumer
-			}
-			session.mu.Unlock()
-		}
+		channel, consumers, err := session.setupChannel(connection)
 		if err != nil {
 			if channel != nil {
 				_ = channel.Close()
@@ -93,20 +68,59 @@ func (session *rabbitSession) supervise() {
 			continue
 		}
 		backoff = rabbitReconnectBase
-		confirmations := channel.NotifyPublish(make(chan amqp.Confirmation, 1))
-		closed := channel.NotifyClose(make(chan *amqp.Error, 1))
-		session.install(channel, confirmations, consumers)
-		managerChanged := session.manager.ConnectionChanged()
-		select {
-		case <-session.ctx.Done():
-			_ = channel.Close()
-			return
-		case <-closed:
-		case <-managerChanged:
-		}
-		session.remove(channel)
-		_ = channel.Close()
+		session.runSession(channel, consumers)
 	}
+}
+
+// setupChannel opens and configures a channel with topology, confirms, QoS, and
+// consumers for every desired consumer ID. The caller must close the returned
+// channel (even on error, where it may be partially configured) when done.
+func (session *rabbitSession) setupChannel(connection *amqp.Connection) (*amqp.Channel, map[string]<-chan amqp.Delivery, error) {
+	channel, err := connection.Channel()
+	if err == nil {
+		err = declareRabbitTopology(channel, session.queueName)
+	}
+	if err == nil {
+		err = channel.Confirm(false)
+	}
+	if err == nil {
+		err = channel.Qos(rabbitPrefetch, 0, false)
+	}
+	// Establish consumers while holding session.mu so a concurrent consumer()
+	// call cannot write to session.consumers while install() replaces the map.
+	// channel.Consume does not acquire session.mu, so this is safe.
+	consumers := make(map[string]<-chan amqp.Delivery)
+	if err == nil {
+		session.mu.Lock()
+		for consumerID := range session.desiredConsumers {
+			consumer, consumeErr := channel.Consume(session.queueName, consumerID, false, false, false, false, nil)
+			if consumeErr != nil {
+				err = consumeErr
+				break
+			}
+			consumers[consumerID] = consumer
+		}
+		session.mu.Unlock()
+	}
+	return channel, consumers, err
+}
+
+// runSession installs the live channel and blocks until it closes, the manager's
+// connection changes, or the session context is cancelled, then tears it down.
+func (session *rabbitSession) runSession(channel *amqp.Channel, consumers map[string]<-chan amqp.Delivery) {
+	confirmations := channel.NotifyPublish(make(chan amqp.Confirmation, 1))
+	closed := channel.NotifyClose(make(chan *amqp.Error, 1))
+	session.install(channel, confirmations, consumers)
+	managerChanged := session.manager.ConnectionChanged()
+	select {
+	case <-session.ctx.Done():
+		_ = channel.Close()
+		return
+	case <-closed:
+	case <-managerChanged:
+	}
+	session.remove(channel)
+	_ = channel.Close()
 }
 
 func declareRabbitTopology(channel *amqp.Channel, queueName string) error {

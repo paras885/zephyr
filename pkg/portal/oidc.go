@@ -59,14 +59,8 @@ type oidcSession struct {
 }
 
 func NewOIDC(api http.Handler, options OIDCOptions) (http.Handler, error) {
-	if api == nil {
-		return nil, fmt.Errorf("portal API handler is required")
-	}
-	if options.Client == nil {
-		return nil, fmt.Errorf("OIDC client is required")
-	}
-	if len(options.CookieHashKey) < 32 || len(options.CookieBlockKey) != 32 {
-		return nil, fmt.Errorf("OIDC cookie hash key must be at least 32 bytes and block key must be exactly 32 bytes")
+	if err := validateOIDCOptions(api, options); err != nil {
+		return nil, err
 	}
 	redirect, err := url.Parse(options.Client.RedirectURL())
 	if err != nil || redirect.Scheme == "" || redirect.Host == "" {
@@ -86,27 +80,9 @@ func NewOIDC(api http.Handler, options OIDCOptions) (http.Handler, error) {
 	handler := &oidcHandler{api: api, portal: portal, client: options.Client, codec: codec, secure: options.SecureCookies, redirect: redirect, sessions: sessions}
 	mux := http.NewServeMux()
 	if options.CLIIssuerURL != "" {
-		issuer, err := url.Parse(options.CLIIssuerURL)
-		if err != nil || issuer.Host == "" || issuer.User != nil || issuer.RawQuery != "" || issuer.Fragment != "" ||
-			(issuer.Scheme != "https" && !(issuer.Scheme == "http" && (issuer.Hostname() == "localhost" || issuer.Hostname() == "127.0.0.1" || issuer.Hostname() == "::1"))) {
-			return nil, fmt.Errorf("CLI issuer must be HTTPS (or loopback HTTP) without credentials, query or fragment")
+		if err := registerCLIConfigRoute(mux, options); err != nil {
+			return nil, err
 		}
-		clientID := options.CLIClientID
-		if clientID == "" {
-			clientID = "zephyr-cli"
-		}
-		mux.HandleFunc("/auth/config", func(response http.ResponseWriter, request *http.Request) {
-			if request.Method != http.MethodGet {
-				http.Error(response, "method not allowed", http.StatusMethodNotAllowed)
-				return
-			}
-			response.Header().Set("Content-Type", "application/json")
-			response.Header().Set("Cache-Control", "no-store")
-			_ = json.NewEncoder(response).Encode(map[string]string{
-				"issuer": options.CLIIssuerURL, "client_id": clientID,
-				"grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-			})
-		})
 	}
 	mux.HandleFunc("/auth/login", handler.login)
 	mux.HandleFunc("/auth/callback", handler.callback)
@@ -115,6 +91,44 @@ func NewOIDC(api http.Handler, options OIDCOptions) (http.Handler, error) {
 	mux.HandleFunc("/v1/", handler.apiRequest)
 	mux.Handle("/", http.HandlerFunc(handler.portalRequest))
 	return mux, nil
+}
+
+func validateOIDCOptions(api http.Handler, options OIDCOptions) error {
+	if api == nil {
+		return fmt.Errorf("portal API handler is required")
+	}
+	if options.Client == nil {
+		return fmt.Errorf("OIDC client is required")
+	}
+	if len(options.CookieHashKey) < 32 || len(options.CookieBlockKey) != 32 {
+		return fmt.Errorf("OIDC cookie hash key must be at least 32 bytes and block key must be exactly 32 bytes")
+	}
+	return nil
+}
+
+func registerCLIConfigRoute(mux *http.ServeMux, options OIDCOptions) error {
+	issuer, err := url.Parse(options.CLIIssuerURL)
+	if err != nil || issuer.Host == "" || issuer.User != nil || issuer.RawQuery != "" || issuer.Fragment != "" ||
+		(issuer.Scheme != "https" && !(issuer.Scheme == "http" && (issuer.Hostname() == "localhost" || issuer.Hostname() == "127.0.0.1" || issuer.Hostname() == "::1"))) {
+		return fmt.Errorf("CLI issuer must be HTTPS (or loopback HTTP) without credentials, query or fragment")
+	}
+	clientID := options.CLIClientID
+	if clientID == "" {
+		clientID = "zephyr-cli"
+	}
+	mux.HandleFunc("/auth/config", func(response http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet {
+			http.Error(response, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		response.Header().Set("Content-Type", "application/json")
+		response.Header().Set("Cache-Control", "no-store")
+		_ = json.NewEncoder(response).Encode(map[string]string{
+			"issuer": options.CLIIssuerURL, "client_id": clientID,
+			"grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+		})
+	})
+	return nil
 }
 
 func (handler *oidcHandler) login(response http.ResponseWriter, request *http.Request) {
@@ -152,45 +166,65 @@ func (handler *oidcHandler) callback(response http.ResponseWriter, request *http
 		http.Error(response, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	flow, code, ok := handler.parseCallbackFlow(response, request)
+	if !ok {
+		return
+	}
+	token, ok := handler.exchangeCallbackToken(response, request, flow, code)
+	if !ok {
+		return
+	}
+	handler.finishCallbackSession(response, request, token)
+}
+
+func (handler *oidcHandler) parseCallbackFlow(response http.ResponseWriter, request *http.Request) (oidcFlow, string, bool) {
 	flowCookie, err := request.Cookie(oidcFlowCookie)
 	if err != nil {
 		http.Error(response, "sign-in session expired", http.StatusBadRequest)
-		return
+		return oidcFlow{}, "", false
 	}
 	var flow oidcFlow
 	if err := handler.codec.Decode(oidcFlowCookie, flowCookie.Value, &flow); err != nil || flow.ExpiresAt < time.Now().Unix() {
 		http.SetCookie(response, handler.expiredCookie(oidcFlowCookie, "/auth/callback"))
 		http.Error(response, "sign-in session expired", http.StatusBadRequest)
-		return
+		return oidcFlow{}, "", false
 	}
 	http.SetCookie(response, handler.expiredCookie(oidcFlowCookie, "/auth/callback"))
 	if request.URL.Query().Get("error") != "" || !constantTimeEqual(request.URL.Query().Get("state"), flow.State) {
 		http.Error(response, "OIDC sign-in was not authorized", http.StatusUnauthorized)
-		return
+		return oidcFlow{}, "", false
 	}
 	code := request.URL.Query().Get("code")
 	if code == "" {
 		http.Error(response, "OIDC authorization code is required", http.StatusBadRequest)
-		return
+		return oidcFlow{}, "", false
 	}
+	return flow, code, true
+}
+
+func (handler *oidcHandler) exchangeCallbackToken(response http.ResponseWriter, request *http.Request, flow oidcFlow, code string) (*oauth2.Token, bool) {
 	token, err := handler.client.Exchange(request.Context(), code, flow.Verifier)
 	if err != nil {
 		http.Error(response, "OIDC token exchange failed", http.StatusUnauthorized)
-		return
+		return nil, false
 	}
 	rawIDToken, _ := token.Extra("id_token").(string)
 	if rawIDToken == "" || handler.client.VerifyIDToken(request.Context(), rawIDToken, flow.Nonce) != nil {
 		http.Error(response, "OIDC identity token is invalid", http.StatusUnauthorized)
-		return
+		return nil, false
 	}
 	if err := handler.client.Authorize(request.Context(), token.AccessToken, "zephyr:workflow:read"); err != nil {
 		http.Error(response, "account lacks workflow read permission", http.StatusForbidden)
-		return
+		return nil, false
 	}
 	if token.Expiry.IsZero() || !token.Expiry.After(time.Now()) {
 		http.Error(response, "OIDC access token has no valid expiry", http.StatusUnauthorized)
-		return
+		return nil, false
 	}
+	return token, true
+}
+
+func (handler *oidcHandler) finishCallbackSession(response http.ResponseWriter, request *http.Request, token *oauth2.Token) {
 	encoded, err := handler.codec.Encode("session-data", oidcSession{AccessToken: token.AccessToken, RefreshToken: token.RefreshToken, ExpiresAt: token.Expiry.Unix()})
 	if err != nil {
 		http.Error(response, "could not create sign-in session", http.StatusInternalServerError)
@@ -322,43 +356,9 @@ func (handler *oidcHandler) session(request *http.Request) (oidcSession, bool, e
 	ctx, cancel := context.WithTimeout(request.Context(), 10*time.Second)
 	defer cancel()
 	err = handler.sessions.UpdateSession(ctx, cookie.Value, func(stored *identity.Session) error {
-		if err := handler.codec.Decode("session-data", stored.Data, &session); err != nil {
-			slog.Warn("invalid encrypted portal session")
-			return identity.ErrSessionNotFound
-		}
-		if session.AccessToken == "" {
-			return identity.ErrSessionNotFound
-		}
-		if session.ExpiresAt > time.Now().Add(15*time.Second).Unix() {
-			return nil
-		}
-		if session.RefreshToken == "" {
-			if session.ExpiresAt <= time.Now().Unix() {
-				return identity.ErrSessionNotFound
-			}
-			return nil
-		}
-		fresh, err := handler.client.Refresh(ctx, session.RefreshToken)
-		if err != nil {
-			var failure *oauth2.RetrieveError
-			if errors.As(err, &failure) && failure.ErrorCode == "invalid_grant" {
-				return identity.ErrSessionNotFound
-			}
-			return fmt.Errorf("portal renewal failed: %w", err)
-		}
-		if fresh.AccessToken == "" || fresh.Expiry.IsZero() || !fresh.Expiry.After(time.Now()) {
-			return fmt.Errorf("identity provider returned invalid renewed token")
-		}
-		if err := handler.client.Authorize(ctx, fresh.AccessToken, "zephyr:workflow:read"); err != nil {
-			return identity.ErrSessionNotFound
-		}
-		session.AccessToken = fresh.AccessToken
-		session.ExpiresAt = fresh.Expiry.Unix()
-		if fresh.RefreshToken != "" {
-			session.RefreshToken = fresh.RefreshToken
-		}
-		stored.Data, err = handler.codec.Encode("session-data", session)
-		return err
+		updated, updateErr := handler.refreshStoredSession(ctx, stored)
+		session = updated
+		return updateErr
 	})
 	if errors.Is(err, identity.ErrSessionNotFound) {
 		if deleteErr := handler.sessions.DeleteSession(ctx, cookie.Value); deleteErr != nil {
@@ -370,6 +370,48 @@ func (handler *oidcHandler) session(request *http.Request) (oidcSession, bool, e
 		return oidcSession{}, false, err
 	}
 	return session, true, nil
+}
+
+func (handler *oidcHandler) refreshStoredSession(ctx context.Context, stored *identity.Session) (oidcSession, error) {
+	var session oidcSession
+	if err := handler.codec.Decode("session-data", stored.Data, &session); err != nil {
+		slog.Warn("invalid encrypted portal session")
+		return oidcSession{}, identity.ErrSessionNotFound
+	}
+	if session.AccessToken == "" {
+		return oidcSession{}, identity.ErrSessionNotFound
+	}
+	if session.ExpiresAt > time.Now().Add(15*time.Second).Unix() {
+		return session, nil
+	}
+	if session.RefreshToken == "" {
+		if session.ExpiresAt <= time.Now().Unix() {
+			return oidcSession{}, identity.ErrSessionNotFound
+		}
+		return session, nil
+	}
+	fresh, err := handler.client.Refresh(ctx, session.RefreshToken)
+	if err != nil {
+		var failure *oauth2.RetrieveError
+		if errors.As(err, &failure) && failure.ErrorCode == "invalid_grant" {
+			return oidcSession{}, identity.ErrSessionNotFound
+		}
+		return oidcSession{}, fmt.Errorf("portal renewal failed: %w", err)
+	}
+	if fresh.AccessToken == "" || fresh.Expiry.IsZero() || !fresh.Expiry.After(time.Now()) {
+		return oidcSession{}, fmt.Errorf("identity provider returned invalid renewed token")
+	}
+	if err := handler.client.Authorize(ctx, fresh.AccessToken, "zephyr:workflow:read"); err != nil {
+		return oidcSession{}, identity.ErrSessionNotFound
+	}
+	session.AccessToken = fresh.AccessToken
+	session.ExpiresAt = fresh.Expiry.Unix()
+	if fresh.RefreshToken != "" {
+		session.RefreshToken = fresh.RefreshToken
+	}
+	var encodeErr error
+	stored.Data, encodeErr = handler.codec.Encode("session-data", session)
+	return session, encodeErr
 }
 
 func (handler *oidcHandler) sessionError(response http.ResponseWriter, err error) {

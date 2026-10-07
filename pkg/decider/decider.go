@@ -149,18 +149,36 @@ func (decider *Decider) Recover(ctx context.Context) error {
 	if !ok {
 		return fmt.Errorf("execution store does not support recovery queries")
 	}
+	executions, err := decider.listRecoverableExecutions(ctx, queryStore)
+	if err != nil {
+		return err
+	}
+	for _, instance := range executions {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := decider.recoverExecution(instance); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// listRecoverableExecutions pages through every execution store status that
+// requires recovery handling and returns the combined set of instances.
+func (decider *Decider) listRecoverableExecutions(ctx context.Context, queryStore store.ExecutionQueryStore) ([]*domain.WorkflowInstance, error) {
 	statuses := []domain.WorkflowStatus{domain.WorkflowPending, domain.WorkflowRunning, domain.WorkflowCompensating}
 	executions := make([]*domain.WorkflowInstance, 0)
 	for _, status := range statuses {
 		for offset := 0; ; {
 			if err := ctx.Err(); err != nil {
-				return err
+				return nil, err
 			}
 			page, total, err := queryStore.ListExecutions(ctx, store.ExecutionFilter{
 				Status: status, Limit: recoveryPageSize, Offset: offset,
 			})
 			if err != nil {
-				return err
+				return nil, err
 			}
 			executions = append(executions, page...)
 			offset += len(page)
@@ -169,42 +187,52 @@ func (decider *Decider) Recover(ctx context.Context) error {
 			}
 		}
 	}
-	for _, instance := range executions {
-		if err := ctx.Err(); err != nil {
-			return err
+	return executions, nil
+}
+
+// recoverExecution resumes a single workflow instance discovered during
+// recovery, dispatching it based on its current status.
+func (decider *Decider) recoverExecution(instance *domain.WorkflowInstance) error {
+	if instance.Status == domain.WorkflowPending {
+		if _, err := decider.StartExisting(instance); err != nil {
+			return fmt.Errorf("resume workflow %q: %w", instance.ID, err)
 		}
-		if instance.Status == domain.WorkflowPending {
-			if _, err := decider.StartExisting(instance); err != nil {
-				return fmt.Errorf("resume workflow %q: %w", instance.ID, err)
-			}
-			continue
+		return nil
+	}
+	if err := decider.scheduleRetries(instance); err != nil {
+		return fmt.Errorf("recover retries for workflow %q: %w", instance.ID, err)
+	}
+	if err := decider.schedulePendingDelays(instance); err != nil {
+		return fmt.Errorf("recover delays for workflow %q: %w", instance.ID, err)
+	}
+	if instance.Status == domain.WorkflowRunning {
+		if err := decider.advance(instance.ID); err != nil {
+			return fmt.Errorf("advance recovered workflow %q: %w", instance.ID, err)
 		}
-		if err := decider.scheduleRetries(instance); err != nil {
-			return fmt.Errorf("recover retries for workflow %q: %w", instance.ID, err)
-		}
-		if err := decider.schedulePendingDelays(instance); err != nil {
-			return fmt.Errorf("recover delays for workflow %q: %w", instance.ID, err)
-		}
-		if instance.Status == domain.WorkflowRunning {
-			if err := decider.advance(instance.ID); err != nil {
-				return fmt.Errorf("advance recovered workflow %q: %w", instance.ID, err)
-			}
-		} else if instance.Status == domain.WorkflowCompensating && !hasActiveTaskWork(instance) {
-			if err := decider.withWorkflowLock(instance.ID, func() error {
-				current, err := decider.store.Get(instance.ID)
-				if err != nil {
-					return err
-				}
-				if current.Status == domain.WorkflowCompensating && !hasActiveTaskWork(current) {
-					return decider.scheduleNextCompensation(instance.ID)
-				}
-				return nil
-			}); err != nil {
-				return fmt.Errorf("resume compensation for workflow %q: %w", instance.ID, err)
-			}
+		return nil
+	}
+	if instance.Status == domain.WorkflowCompensating && !hasActiveTaskWork(instance) {
+		if err := decider.resumeCompensationLocked(instance.ID); err != nil {
+			return fmt.Errorf("resume compensation for workflow %q: %w", instance.ID, err)
 		}
 	}
 	return nil
+}
+
+// resumeCompensationLocked acquires the workflow lock and re-checks the
+// current state before scheduling the next compensation step, guarding
+// against a state change between the recovery scan and this call.
+func (decider *Decider) resumeCompensationLocked(workflowID string) error {
+	return decider.withWorkflowLock(workflowID, func() error {
+		current, err := decider.store.Get(workflowID)
+		if err != nil {
+			return err
+		}
+		if current.Status == domain.WorkflowCompensating && !hasActiveTaskWork(current) {
+			return decider.scheduleNextCompensation(workflowID)
+		}
+		return nil
+	})
 }
 
 func (decider *Decider) RunRecovery(ctx context.Context, interval time.Duration) error {
@@ -326,57 +354,82 @@ func (decider *Decider) failTaskLocked(workflowID, nodeID, taskError string) err
 		return fmt.Errorf("task node %q has status %s", nodeID, task.Status)
 	}
 	if task.Attempt <= task.RetryLimit {
-		_, span := otel.Tracer("zephyr/decider").Start(context.Background(), "task.retry_schedule")
-		span.SetAttributes(attribute.String("workflow.id", workflowID), attribute.String("task.id", task.ID), attribute.String("task.node_id", nodeID), attribute.Int("task.next_attempt", task.Attempt+1))
-		defer span.End()
-		retryAt := time.Now().Add(task.RetryBackoff)
-		if err := decider.store.AppendMany(workflowID, []domain.Event{
-			{WorkflowID: workflowID, TaskID: task.ID, NodeID: nodeID, Type: domain.EventTaskFailed, Payload: map[string]any{"error": taskError}},
-			{WorkflowID: workflowID, TaskID: task.ID, NodeID: nodeID, Type: domain.EventTaskRetryScheduled, Payload: map[string]any{"error": taskError, "retry_at": retryAt, "attempt": task.Attempt + 1}},
-		}); err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, "schedule retry failed")
-			decider.recordOperation("task_retry_schedule", "error", 0)
-			return err
-		}
-		slog.Warn("task retry scheduled", "workflow_id", workflowID, "task_id", task.ID, "node_id", nodeID, "attempt", task.Attempt+1, "retry_at", retryAt)
-		decider.recordOperation("task_retry_schedule", "scheduled", 0)
-		if task.IsCompensation {
-			updated, err := decider.store.Get(workflowID)
-			if err != nil {
-				return err
-			}
-			return decider.scheduleRetries(updated)
-		}
-		return decider.advanceUnlocked(workflowID)
+		return decider.scheduleTaskRetryLocked(workflowID, nodeID, taskError, task)
 	}
 	if task.IsCompensation {
-		_, span := otel.Tracer("zephyr/decider").Start(context.Background(), "compensation.failed", trace.WithAttributes(
-			attribute.String("workflow.id", workflowID), attribute.String("task.id", task.ID), attribute.String("task.node_id", nodeID),
-		))
-		defer span.End()
-		err := decider.store.AppendMany(workflowID, []domain.Event{
-			{WorkflowID: workflowID, TaskID: task.ID, NodeID: nodeID, Type: domain.EventTaskFailed, Payload: map[string]any{"error": taskError}},
-			{WorkflowID: workflowID, Type: domain.EventWorkflowFailed, Payload: map[string]any{"error": "compensation failed: " + taskError}},
-		})
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, "persist compensation failure failed")
-		}
-		return err
+		return decider.failCompensationTaskLocked(workflowID, nodeID, taskError, task)
 	}
 	if task.FanOutID != "" {
-		if err := decider.store.AppendMany(workflowID, []domain.Event{
-			{WorkflowID: workflowID, TaskID: task.ID, NodeID: nodeID, Type: domain.EventTaskFailed, Payload: map[string]any{"error": taskError}},
-			{WorkflowID: workflowID, NodeID: nodeID, Type: domain.EventFanOutItemFailed, Payload: map[string]any{
-				"fan_out_id": task.FanOutID, "item_index": task.FanOutIndex,
-				"fan_out_ancestors": task.FanOutAncestors, "error": taskError,
-			}},
-		}); err != nil {
+		return decider.failFanOutTaskLocked(workflowID, nodeID, taskError, task)
+	}
+	return decider.requestWorkflowFailureLocked(workflowID, nodeID, taskError, task)
+}
+
+// scheduleTaskRetryLocked persists the failure and the next retry attempt for
+// a task that has not yet exhausted its retry limit. Caller must already
+// hold the workflow lock.
+func (decider *Decider) scheduleTaskRetryLocked(workflowID, nodeID, taskError string, task domain.TaskInstance) error {
+	_, span := otel.Tracer("zephyr/decider").Start(context.Background(), "task.retry_schedule")
+	span.SetAttributes(attribute.String("workflow.id", workflowID), attribute.String("task.id", task.ID), attribute.String("task.node_id", nodeID), attribute.Int("task.next_attempt", task.Attempt+1))
+	defer span.End()
+	retryAt := time.Now().Add(task.RetryBackoff)
+	if err := decider.store.AppendMany(workflowID, []domain.Event{
+		{WorkflowID: workflowID, TaskID: task.ID, NodeID: nodeID, Type: domain.EventTaskFailed, Payload: map[string]any{"error": taskError}},
+		{WorkflowID: workflowID, TaskID: task.ID, NodeID: nodeID, Type: domain.EventTaskRetryScheduled, Payload: map[string]any{"error": taskError, "retry_at": retryAt, "attempt": task.Attempt + 1}},
+	}); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "schedule retry failed")
+		decider.recordOperation("task_retry_schedule", "error", 0)
+		return err
+	}
+	slog.Warn("task retry scheduled", "workflow_id", workflowID, "task_id", task.ID, "node_id", nodeID, "attempt", task.Attempt+1, "retry_at", retryAt)
+	decider.recordOperation("task_retry_schedule", "scheduled", 0)
+	if task.IsCompensation {
+		updated, err := decider.store.Get(workflowID)
+		if err != nil {
 			return err
 		}
-		return decider.advanceUnlocked(workflowID)
+		return decider.scheduleRetries(updated)
 	}
+	return decider.advanceUnlocked(workflowID)
+}
+
+// failCompensationTaskLocked records a compensation task's final failure,
+// which fails the whole workflow. Caller must already hold the workflow lock.
+func (decider *Decider) failCompensationTaskLocked(workflowID, nodeID, taskError string, task domain.TaskInstance) error {
+	_, span := otel.Tracer("zephyr/decider").Start(context.Background(), "compensation.failed", trace.WithAttributes(
+		attribute.String("workflow.id", workflowID), attribute.String("task.id", task.ID), attribute.String("task.node_id", nodeID),
+	))
+	defer span.End()
+	err := decider.store.AppendMany(workflowID, []domain.Event{
+		{WorkflowID: workflowID, TaskID: task.ID, NodeID: nodeID, Type: domain.EventTaskFailed, Payload: map[string]any{"error": taskError}},
+		{WorkflowID: workflowID, Type: domain.EventWorkflowFailed, Payload: map[string]any{"error": "compensation failed: " + taskError}},
+	})
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "persist compensation failure failed")
+	}
+	return err
+}
+
+// failFanOutTaskLocked records the failure of a single fan-out item. Caller
+// must already hold the workflow lock.
+func (decider *Decider) failFanOutTaskLocked(workflowID, nodeID, taskError string, task domain.TaskInstance) error {
+	if err := decider.store.AppendMany(workflowID, []domain.Event{
+		{WorkflowID: workflowID, TaskID: task.ID, NodeID: nodeID, Type: domain.EventTaskFailed, Payload: map[string]any{"error": taskError}},
+		{WorkflowID: workflowID, NodeID: nodeID, Type: domain.EventFanOutItemFailed, Payload: map[string]any{
+			"fan_out_id": task.FanOutID, "item_index": task.FanOutIndex,
+			"fan_out_ancestors": task.FanOutAncestors, "error": taskError,
+		}},
+	}); err != nil {
+		return err
+	}
+	return decider.advanceUnlocked(workflowID)
+}
+
+// requestWorkflowFailureLocked records a plain task failure as a workflow
+// failure request. Caller must already hold the workflow lock.
+func (decider *Decider) requestWorkflowFailureLocked(workflowID, nodeID, taskError string, task domain.TaskInstance) error {
 	if err := decider.store.AppendMany(workflowID, []domain.Event{
 		{WorkflowID: workflowID, TaskID: task.ID, NodeID: nodeID, Type: domain.EventTaskFailed, Payload: map[string]any{"error": taskError}},
 		{WorkflowID: workflowID, Type: domain.EventWorkflowFailureRequested, Payload: map[string]any{"error": taskError}},
@@ -395,55 +448,13 @@ func (decider *Decider) scheduleNextCompensation(workflowID string) error {
 		span.SetStatus(codes.Error, "read compensation state failed")
 		return err
 	}
-	compensated := make(map[string]bool)
-	for _, task := range instance.Tasks {
-		if task.IsCompensation && task.Status == domain.TaskCompleted {
-			compensated[task.OriginalNodeID] = true
-		}
-	}
+	compensated := compensatedOriginalNodes(instance)
 	candidates := compensationNodes(instance)
 	for _, originalNodeID := range candidates {
 		if compensated[originalNodeID] {
 			continue
 		}
-		originalNode, ok := lookupNode(instance, originalNodeID)
-		if !ok {
-			return decider.store.Append(workflowID, domain.Event{WorkflowID: workflowID, Type: domain.EventWorkflowFailed, Payload: map[string]any{"error": fmt.Sprintf("compensation source node %q not found", originalNodeID)}})
-		}
-		input := map[string]any{}
-		if originalNode.CompensationInput != nil {
-			value, err := evaluateExpression(originalNode.CompensationInput, instance, originalNode.RuntimeScope)
-			if err != nil {
-				return decider.store.Append(workflowID, domain.Event{
-					WorkflowID: workflowID,
-					Type:       domain.EventWorkflowFailed,
-					Payload:    map[string]any{"error": fmt.Sprintf("evaluate compensation input for %q: %v", originalNodeID, err)},
-				})
-			}
-			var ok bool
-			input, ok = value.(map[string]any)
-			if !ok {
-				return decider.store.Append(workflowID, domain.Event{
-					WorkflowID: workflowID,
-					Type:       domain.EventWorkflowFailed,
-					Payload:    map[string]any{"error": fmt.Sprintf("compensation input for %q returned %T, want object", originalNodeID, value)},
-				})
-			}
-		}
-		return decider.store.Append(workflowID, domain.Event{
-			WorkflowID: workflowID,
-			TaskID:     domain.NewID("compensation-task"),
-			NodeID:     domain.NewID("compensation-node"),
-			Type:       domain.EventCompensationScheduled,
-			Payload: map[string]any{
-				"task_name":        originalNode.Compensation.Name,
-				"input":            input,
-				"original_node_id": originalNodeID,
-				"attempt":          1,
-				"retry_limit":      originalNode.Compensation.Retries,
-				"retry_backoff_ms": int(originalNode.Compensation.Backoff.Milliseconds()),
-			},
-		})
+		return decider.scheduleCompensationForNode(workflowID, instance, originalNodeID)
 	}
 	if len(candidates) == 0 {
 		return decider.store.Append(workflowID, domain.Event{
@@ -453,6 +464,67 @@ func (decider *Decider) scheduleNextCompensation(workflowID string) error {
 		})
 	}
 	return decider.store.Append(workflowID, domain.Event{WorkflowID: workflowID, Type: domain.EventWorkflowCompensated})
+}
+
+// compensatedOriginalNodes returns the set of original node IDs whose
+// compensation task has already completed.
+func compensatedOriginalNodes(instance *domain.WorkflowInstance) map[string]bool {
+	compensated := make(map[string]bool)
+	for _, task := range instance.Tasks {
+		if task.IsCompensation && task.Status == domain.TaskCompleted {
+			compensated[task.OriginalNodeID] = true
+		}
+	}
+	return compensated
+}
+
+// scheduleCompensationForNode appends the event needed to schedule the
+// compensation task for a single original node, or a workflow-failed event
+// if the node or its compensation input cannot be resolved.
+func (decider *Decider) scheduleCompensationForNode(workflowID string, instance *domain.WorkflowInstance, originalNodeID string) error {
+	originalNode, ok := lookupNode(instance, originalNodeID)
+	if !ok {
+		return decider.store.Append(workflowID, domain.Event{WorkflowID: workflowID, Type: domain.EventWorkflowFailed, Payload: map[string]any{"error": fmt.Sprintf("compensation source node %q not found", originalNodeID)}})
+	}
+	input, err := decider.resolveCompensationInput(instance, originalNode, originalNodeID)
+	if err != nil {
+		return decider.store.Append(workflowID, domain.Event{
+			WorkflowID: workflowID,
+			Type:       domain.EventWorkflowFailed,
+			Payload:    map[string]any{"error": err.Error()},
+		})
+	}
+	return decider.store.Append(workflowID, domain.Event{
+		WorkflowID: workflowID,
+		TaskID:     domain.NewID("compensation-task"),
+		NodeID:     domain.NewID("compensation-node"),
+		Type:       domain.EventCompensationScheduled,
+		Payload: map[string]any{
+			"task_name":        originalNode.Compensation.Name,
+			"input":            input,
+			"original_node_id": originalNodeID,
+			"attempt":          1,
+			"retry_limit":      originalNode.Compensation.Retries,
+			"retry_backoff_ms": int(originalNode.Compensation.Backoff.Milliseconds()),
+		},
+	})
+}
+
+// resolveCompensationInput evaluates the compensation input expression for a
+// node, defaulting to an empty object when none is defined.
+func (decider *Decider) resolveCompensationInput(instance *domain.WorkflowInstance, originalNode domain.NodeDefinition, originalNodeID string) (map[string]any, error) {
+	if originalNode.CompensationInput == nil {
+		return map[string]any{}, nil
+	}
+	value, err := evaluateExpression(originalNode.CompensationInput, instance, originalNode.RuntimeScope)
+	if err != nil {
+		return nil, fmt.Errorf("evaluate compensation input for %q: %v", originalNodeID, err)
+	}
+	input, ok := value.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("compensation input for %q returned %T, want object", originalNodeID, value)
+	}
+	return input, nil
 }
 
 func (decider *Decider) withWorkflowLock(workflowID string, operation func() error) error {
@@ -528,104 +600,147 @@ func (decider *Decider) advanceOnce(workflowID string) (returnErr error) {
 		if err := decider.schedulePendingDelays(instance); err != nil {
 			return err
 		}
-		if workflowFailureRequested(instance) {
-			if hasActiveTaskWork(instance) {
-				return nil
-			}
-			return decider.scheduleNextCompensation(workflowID)
-		}
-		if ready, failedFanOutID := fanOutFailureReady(instance); ready {
-			if instance.FailureReason == "" {
-				if err := decider.store.Append(workflowID, domain.Event{WorkflowID: workflowID, Type: domain.EventWorkflowFailureRequested, Payload: map[string]any{"error": fmt.Sprintf("fan-out %q item failed", failedFanOutID)}}); err != nil {
-					return err
-				}
-			}
-			return decider.scheduleNextCompensation(workflowID)
-		}
-		if readyFanOut := readyFanOutNodes(instance); len(readyFanOut) > 0 {
-			if err := decider.expandFanOut(instance, readyFanOut[0]); err != nil {
-				return err
-			}
-			continue
-		}
-		if failNodeID := readyFailNode(instance); failNodeID != "" {
-			if err := decider.executeFailNode(instance, failNodeID); err != nil {
-				return err
-			}
-			failNode, _ := lookupNode(instance, failNodeID)
-			if failNode.FanOutID != "" {
-				continue
-			}
-			continue
-		}
-		if switchID := readySwitch(instance); switchID != "" {
-			if err := decider.evaluateSwitch(instance, switchID); err != nil {
-				return err
-			}
-			continue
-		}
-		if returnNodeID := readyReturnNode(instance); returnNodeID != "" {
-			node, _ := lookupNode(instance, returnNodeID)
-			value, err := evaluateExpression(node.ReturnValue, instance, node.RuntimeScope)
-			if err != nil {
-				return decider.failWorkflow(workflowID, fmt.Errorf("evaluate workflow return: %w", err))
-			}
-			result, ok := value.(map[string]any)
-			if !ok {
-				return decider.failWorkflow(workflowID, fmt.Errorf("workflow return expression returned %T, want object", value))
-			}
-			return decider.store.Append(workflowID, domain.Event{
-				WorkflowID: workflowID, NodeID: returnNodeID, Type: domain.EventWorkflowCompleted,
-				Payload: map[string]any{"result": result},
-			})
-		}
-		if err := decider.scheduleDelays(instance); err != nil {
+		if done, err := decider.handleFailureConditions(workflowID, instance); done {
 			return err
 		}
-		ready := readyNodes(instance)
-		if len(ready) == 0 {
-			if instance.Status == domain.WorkflowRunning && allNodesComplete(instance) {
-				return decider.store.Append(workflowID, domain.Event{WorkflowID: workflowID, Type: domain.EventWorkflowCompleted})
-			}
-			return nil
+		if cont, err := decider.handleStructuralNodes(instance); err != nil {
+			return err
+		} else if cont {
+			continue
 		}
-		for _, nodeID := range ready {
-			node, ok := lookupNode(instance, nodeID)
-			if !ok {
-				return fmt.Errorf("ready node %q not found", nodeID)
-			}
-			input := instance.Context
-			if node.RuntimeScope != nil {
-				input = nil
-			}
-			if node.Input != nil {
-				value, err := evaluateExpression(node.Input, instance, node.RuntimeScope)
-				if err != nil {
-					return decider.failNode(instance, nodeID, fmt.Errorf("evaluate input for task %q: %w", nodeID, err))
-				}
-				var ok bool
-				input, ok = value.(map[string]any)
-				if !ok {
-					return decider.failNode(instance, nodeID, fmt.Errorf("task %q input expression returned %T, want object", nodeID, value))
-				}
-			}
-			if err := decider.store.Append(workflowID, domain.Event{
-				WorkflowID: workflowID,
-				TaskID:     domain.NewID("task"),
-				NodeID:     nodeID,
-				Type:       domain.EventTaskScheduled,
-				Payload: map[string]any{
-					"task_name": node.Task.Name, "input": input,
-					"attempt": 1, "retry_limit": node.Task.Retries,
-					"retry_backoff_ms": node.Task.Backoff.Milliseconds(),
-					"fan_out_id":       node.FanOutID, "fan_out_index": node.FanOutIndex,
-					"fan_out_ancestors": node.FanOutAncestors,
-				},
-			}); err != nil {
-				return err
-			}
+		if done, err := decider.handleReturnNode(workflowID, instance); done {
+			return err
+		}
+		if done, err := decider.scheduleReadyOrComplete(workflowID, instance); done {
+			return err
 		}
 	}
+}
+
+// handleFailureConditions checks whether the workflow has an outstanding
+// failure or fan-out failure request and, if so, reacts to it. The returned
+// bool reports whether advanceOnce should return immediately with the error.
+func (decider *Decider) handleFailureConditions(workflowID string, instance *domain.WorkflowInstance) (bool, error) {
+	if workflowFailureRequested(instance) {
+		if hasActiveTaskWork(instance) {
+			return true, nil
+		}
+		return true, decider.scheduleNextCompensation(workflowID)
+	}
+	if ready, failedFanOutID := fanOutFailureReady(instance); ready {
+		if instance.FailureReason == "" {
+			if err := decider.store.Append(workflowID, domain.Event{WorkflowID: workflowID, Type: domain.EventWorkflowFailureRequested, Payload: map[string]any{"error": fmt.Sprintf("fan-out %q item failed", failedFanOutID)}}); err != nil {
+				return true, err
+			}
+		}
+		return true, decider.scheduleNextCompensation(workflowID)
+	}
+	return false, nil
+}
+
+// handleStructuralNodes expands a ready fan-out, executes a ready fail node,
+// or evaluates a ready switch. The returned bool reports whether the
+// advanceOnce loop should restart its iteration from the top.
+func (decider *Decider) handleStructuralNodes(instance *domain.WorkflowInstance) (bool, error) {
+	if readyFanOut := readyFanOutNodes(instance); len(readyFanOut) > 0 {
+		if err := decider.expandFanOut(instance, readyFanOut[0]); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	if failNodeID := readyFailNode(instance); failNodeID != "" {
+		if err := decider.executeFailNode(instance, failNodeID); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	if switchID := readySwitch(instance); switchID != "" {
+		if err := decider.evaluateSwitch(instance, switchID); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+// handleReturnNode completes the workflow if a workflow-return node is ready.
+// The returned bool reports whether advanceOnce should return immediately.
+func (decider *Decider) handleReturnNode(workflowID string, instance *domain.WorkflowInstance) (bool, error) {
+	returnNodeID := readyReturnNode(instance)
+	if returnNodeID == "" {
+		return false, nil
+	}
+	node, _ := lookupNode(instance, returnNodeID)
+	value, err := evaluateExpression(node.ReturnValue, instance, node.RuntimeScope)
+	if err != nil {
+		return true, decider.failWorkflow(workflowID, fmt.Errorf("evaluate workflow return: %w", err))
+	}
+	result, ok := value.(map[string]any)
+	if !ok {
+		return true, decider.failWorkflow(workflowID, fmt.Errorf("workflow return expression returned %T, want object", value))
+	}
+	return true, decider.store.Append(workflowID, domain.Event{
+		WorkflowID: workflowID, NodeID: returnNodeID, Type: domain.EventWorkflowCompleted,
+		Payload: map[string]any{"result": result},
+	})
+}
+
+// scheduleReadyOrComplete schedules every ready task node, or completes the
+// workflow if there is nothing left ready. The returned bool reports whether
+// advanceOnce should return immediately with the error.
+func (decider *Decider) scheduleReadyOrComplete(workflowID string, instance *domain.WorkflowInstance) (bool, error) {
+	if err := decider.scheduleDelays(instance); err != nil {
+		return true, err
+	}
+	ready := readyNodes(instance)
+	if len(ready) == 0 {
+		if instance.Status == domain.WorkflowRunning && allNodesComplete(instance) {
+			return true, decider.store.Append(workflowID, domain.Event{WorkflowID: workflowID, Type: domain.EventWorkflowCompleted})
+		}
+		return true, nil
+	}
+	return false, decider.scheduleReadyNodes(workflowID, instance, ready)
+}
+
+// scheduleReadyNodes appends a task-scheduled event for every ready node.
+func (decider *Decider) scheduleReadyNodes(workflowID string, instance *domain.WorkflowInstance, ready []string) error {
+	for _, nodeID := range ready {
+		node, ok := lookupNode(instance, nodeID)
+		if !ok {
+			return fmt.Errorf("ready node %q not found", nodeID)
+		}
+		input := instance.Context
+		if node.RuntimeScope != nil {
+			input = nil
+		}
+		if node.Input != nil {
+			value, err := evaluateExpression(node.Input, instance, node.RuntimeScope)
+			if err != nil {
+				return decider.failNode(instance, nodeID, fmt.Errorf("evaluate input for task %q: %w", nodeID, err))
+			}
+			var ok bool
+			input, ok = value.(map[string]any)
+			if !ok {
+				return decider.failNode(instance, nodeID, fmt.Errorf("task %q input expression returned %T, want object", nodeID, value))
+			}
+		}
+		if err := decider.store.Append(workflowID, domain.Event{
+			WorkflowID: workflowID,
+			TaskID:     domain.NewID("task"),
+			NodeID:     nodeID,
+			Type:       domain.EventTaskScheduled,
+			Payload: map[string]any{
+				"task_name": node.Task.Name, "input": input,
+				"attempt": 1, "retry_limit": node.Task.Retries,
+				"retry_backoff_ms": node.Task.Backoff.Milliseconds(),
+				"fan_out_id":       node.FanOutID, "fan_out_index": node.FanOutIndex,
+				"fan_out_ancestors": node.FanOutAncestors,
+			},
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (decider *Decider) scheduleRetries(instance *domain.WorkflowInstance) error {

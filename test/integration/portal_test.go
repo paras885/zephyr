@@ -22,7 +22,7 @@ import (
 )
 
 func TestPortalWorkflowStartWorkerExecutionAndRunInspection(t *testing.T) {
-	source, err := os.ReadFile("../../workflows/checkout.zephyr")
+	source, err := os.ReadFile("../../examples/quickstart/checkout.zephyr")
 	if err != nil {
 		t.Fatal(err)
 	}

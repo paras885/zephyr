@@ -112,36 +112,44 @@ func (parser *Parser) parseTask() (ast.TaskDecl, error) {
 	}
 	declaration := ast.TaskDecl{Name: name, Input: input, Output: output}
 	for !parser.match(lexer.RightBrace) {
-		switch {
-		case parser.match(lexer.Timeout):
-			duration, err := parser.duration()
-			if err != nil {
-				return ast.TaskDecl{}, err
-			}
-			declaration.Timeout = duration
-		case parser.match(lexer.Retries):
-			retries, err := parser.number("retry count")
-			if err != nil {
-				return ast.TaskDecl{}, err
-			}
-			declaration.Retries = retries
-			if err := parser.expect(lexer.With); err != nil {
-				return ast.TaskDecl{}, err
-			}
-			if err := parser.expect(lexer.Backoff); err != nil {
-				return ast.TaskDecl{}, err
-			}
-			backoff, err := parser.duration()
-			if err != nil {
-				return ast.TaskDecl{}, err
-			}
-			declaration.Backoff = backoff
-		default:
-			return ast.TaskDecl{}, parser.errorf("expected timeout or retries policy")
+		if err := parser.parseTaskPolicy(&declaration); err != nil {
+			return ast.TaskDecl{}, err
 		}
 		parser.match(lexer.Semicolon)
 	}
 	return declaration, nil
+}
+
+// parseTaskPolicy parses one timeout or retries policy entry inside a task body.
+func (parser *Parser) parseTaskPolicy(declaration *ast.TaskDecl) error {
+	switch {
+	case parser.match(lexer.Timeout):
+		duration, err := parser.duration()
+		if err != nil {
+			return err
+		}
+		declaration.Timeout = duration
+	case parser.match(lexer.Retries):
+		retries, err := parser.number("retry count")
+		if err != nil {
+			return err
+		}
+		declaration.Retries = retries
+		if err := parser.expect(lexer.With); err != nil {
+			return err
+		}
+		if err := parser.expect(lexer.Backoff); err != nil {
+			return err
+		}
+		backoff, err := parser.duration()
+		if err != nil {
+			return err
+		}
+		declaration.Backoff = backoff
+	default:
+		return parser.errorf("expected timeout or retries policy")
+	}
+	return nil
 }
 
 func (parser *Parser) parseWorkflow() (ast.WorkflowDecl, error) {

@@ -12,7 +12,7 @@ import (
 )
 
 func TestLoadsExampleWorkflowDefinitions(t *testing.T) {
-	definitions, err := loadDefinitions("../../workflows")
+	definitions, err := loadDefinitions("../../examples/quickstart")
 	if err != nil {
 		t.Fatal(err)
 	}

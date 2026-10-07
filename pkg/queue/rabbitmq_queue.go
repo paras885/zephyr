@@ -290,34 +290,11 @@ func (queue *RabbitMQQueue) receiveManaged(ctx context.Context, workerID string)
 				}
 				continue
 			}
-			var item WorkItem
-			if err := json.Unmarshal(message.Body, &item); err != nil {
-				_ = message.Reject(true)
-				return Delivery{}, fmt.Errorf("unmarshal work item: %w", err)
+			delivery, retry, err := queue.deliverMessage(workerID, message)
+			if retry {
+				continue
 			}
-			deliveryID := rabbitDeliveryID(workerID, message.DeliveryTag)
-			queue.mu.Lock()
-			if item.ID != "" {
-				if queue.completed.contains(item.ID) {
-					queue.mu.Unlock()
-					if err := message.Ack(false); err != nil {
-						return Delivery{}, fmt.Errorf("ack completed RabbitMQ duplicate: %w", err)
-					}
-					continue
-				}
-				active, exists := queue.activeIDs[item.ID]
-				if exists && active.deliveryID != "" && !(active.requeuePending && message.Redelivered) {
-					queue.mu.Unlock()
-					if err := message.Ack(false); err != nil {
-						return Delivery{}, fmt.Errorf("ack duplicate RabbitMQ delivery: %w", err)
-					}
-					continue
-				}
-				queue.activeIDs[item.ID] = rabbitActiveItem{deliveryID: deliveryID}
-			}
-			queue.inFlight[deliveryID] = rabbitQueueDelivery{message: message, itemID: item.ID}
-			queue.mu.Unlock()
-			return Delivery{ID: deliveryID, Item: item}, nil
+			return delivery, err
 		case <-changed:
 		case <-ctx.Done():
 			return Delivery{}, ctx.Err()
@@ -325,6 +302,40 @@ func (queue *RabbitMQQueue) receiveManaged(ctx context.Context, workerID string)
 			return Delivery{}, ErrClosed
 		}
 	}
+}
+
+// deliverMessage decodes and claims a single RabbitMQ message. retry is true when
+// the caller should continue its receive loop without returning a delivery (for
+// example, after acking an already-completed or duplicate message).
+func (queue *RabbitMQQueue) deliverMessage(workerID string, message amqp.Delivery) (Delivery, bool, error) {
+	var item WorkItem
+	if err := json.Unmarshal(message.Body, &item); err != nil {
+		_ = message.Reject(true)
+		return Delivery{}, false, fmt.Errorf("unmarshal work item: %w", err)
+	}
+	deliveryID := rabbitDeliveryID(workerID, message.DeliveryTag)
+	queue.mu.Lock()
+	if item.ID != "" {
+		if queue.completed.contains(item.ID) {
+			queue.mu.Unlock()
+			if err := message.Ack(false); err != nil {
+				return Delivery{}, false, fmt.Errorf("ack completed RabbitMQ duplicate: %w", err)
+			}
+			return Delivery{}, true, nil
+		}
+		active, exists := queue.activeIDs[item.ID]
+		if exists && active.deliveryID != "" && !(active.requeuePending && message.Redelivered) {
+			queue.mu.Unlock()
+			if err := message.Ack(false); err != nil {
+				return Delivery{}, false, fmt.Errorf("ack duplicate RabbitMQ delivery: %w", err)
+			}
+			return Delivery{}, true, nil
+		}
+		queue.activeIDs[item.ID] = rabbitActiveItem{deliveryID: deliveryID}
+	}
+	queue.inFlight[deliveryID] = rabbitQueueDelivery{message: message, itemID: item.ID}
+	queue.mu.Unlock()
+	return Delivery{ID: deliveryID, Item: item}, false, nil
 }
 
 func (queue *RabbitMQQueue) syncGeneration(generation uint64) {
