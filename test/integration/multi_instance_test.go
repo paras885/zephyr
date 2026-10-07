@@ -46,7 +46,15 @@ func TestTwoGatewayInstancesSharePostgresLeasesAndRabbitMQWork(t *testing.T) {
 		ContainerRequest: testcontainers.ContainerRequest{
 			Image: "postgres:16-alpine", Env: map[string]string{
 				"POSTGRES_USER": "zephyr", "POSTGRES_PASSWORD": "zephyr-test", "POSTGRES_DB": "zephyr",
-			}, ExposedPorts: []string{"5432/tcp"}, WaitingFor: wait.ForListeningPort("5432/tcp"),
+			}, ExposedPorts: []string{"5432/tcp"},
+			// ForListeningPort alone is insufficient: Postgres opens its TCP
+			// listener for a temporary initdb server before restarting into
+			// the real server, so "ready to accept connections" is logged
+			// twice before it's actually ready for use.
+			WaitingFor: wait.ForAll(
+				wait.ForListeningPort("5432/tcp"),
+				wait.ForLog("database system is ready to accept connections").WithOccurrence(2),
+			),
 		}, Started: true,
 	})
 	if err != nil {
