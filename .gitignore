@@ -3,7 +3,7 @@ zephyr.db-shm
 zephyr.db-wal
 
 # Build artifacts
-zephyr-gen
+/zephyr
 /bin/
 /dist/
 /.kind-build/
@@ -14,4 +14,4 @@ node_modules/
 test-results/
 playwright-report/
 kind-load-summary.json
-
+examples/oidc-demo/.local/

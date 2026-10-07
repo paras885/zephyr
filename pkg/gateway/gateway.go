@@ -169,7 +169,6 @@ type Gateway struct {
 	leases     *lease.Manager
 
 	mu           sync.Mutex
-	definitions  map[string]map[int]domain.WorkflowDef
 	publications *TaskPublicationDispatcher
 }
 
@@ -199,7 +198,6 @@ func New(engine *decider.Decider, executions store.ExecutionStore, workQueue que
 		executions:   executions,
 		workQueue:    workQueue,
 		leases:       leases,
-		definitions:  make(map[string]map[int]domain.WorkflowDef),
 		publications: publications,
 	}
 	engine.SetRetryPublisher(func(workflowID string) error {
@@ -235,22 +233,32 @@ func (gateway *Gateway) RegisterWorkflow(definition domain.WorkflowDef) error {
 	if err := definition.Validate(); err != nil {
 		return err
 	}
-	gateway.mu.Lock()
-	defer gateway.mu.Unlock()
-	versions := gateway.definitions[definition.Name]
-	if versions == nil {
-		versions = make(map[int]domain.WorkflowDef)
-		gateway.definitions[definition.Name] = versions
+	registry, ok := gateway.executions.(store.WorkflowRegistry)
+	if !ok {
+		return fmt.Errorf("execution store does not support workflow registration")
 	}
-	versions[definition.Version] = definition
-	return nil
+	return registry.PutWorkflow(context.Background(), store.RegisteredWorkflow{Definition: definition})
 }
 
-func (gateway *Gateway) ListWorkflows() []WorkflowSummary {
-	gateway.mu.Lock()
-	defer gateway.mu.Unlock()
-	summaries := make([]WorkflowSummary, 0, len(gateway.definitions))
-	for name, versions := range gateway.definitions {
+func (gateway *Gateway) ListWorkflows(ctx context.Context) ([]WorkflowSummary, error) {
+	registry, ok := gateway.executions.(store.WorkflowRegistry)
+	if !ok {
+		return nil, fmt.Errorf("execution store does not support workflow registration")
+	}
+	records, err := registry.ListDefinitions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	definitions := make(map[string]map[int]domain.WorkflowDef)
+	for _, record := range records {
+		definition := record.Definition
+		if definitions[definition.Name] == nil {
+			definitions[definition.Name] = make(map[int]domain.WorkflowDef)
+		}
+		definitions[definition.Name][definition.Version] = definition
+	}
+	summaries := make([]WorkflowSummary, 0, len(definitions))
+	for name, versions := range definitions {
 		summary := WorkflowSummary{Name: name}
 		for version, definition := range versions {
 			summary.Versions = append(summary.Versions, version)
@@ -269,11 +277,11 @@ func (gateway *Gateway) ListWorkflows() []WorkflowSummary {
 		summaries = append(summaries, summary)
 	}
 	sort.Slice(summaries, func(left, right int) bool { return summaries[left].Name < summaries[right].Name })
-	return summaries
+	return summaries, nil
 }
 
 func (gateway *Gateway) WorkflowDefinition(name string, version int) (domain.WorkflowDef, error) {
-	return gateway.definition(name, version)
+	return gateway.definition(context.Background(), name, version)
 }
 
 func (gateway *Gateway) ListWorkflowRuns(ctx context.Context, workflowName string, status domain.WorkflowStatus, limit, offset int) (WorkflowRunPage, error) {
@@ -378,7 +386,7 @@ func summarizeRun(instance *domain.WorkflowInstance) WorkflowRunSummary {
 func (gateway *Gateway) StartWorkflow(ctx context.Context, name string, version int, workflowContext map[string]any) (*domain.WorkflowInstance, error) {
 	ctx, span := otel.Tracer("zephyr/gateway").Start(ctx, "workflow.start", trace.WithAttributes(attribute.String("workflow.name", name), attribute.Int("workflow.version", version)))
 	defer span.End()
-	definition, err := gateway.definition(name, version)
+	definition, err := gateway.definition(ctx, name, version)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "workflow definition lookup failed")
@@ -406,7 +414,7 @@ func (gateway *Gateway) StartWorkflowIdempotent(ctx context.Context, name string
 	if key == "" {
 		return nil, fmt.Errorf("Idempotency-Key must not be empty")
 	}
-	definition, err := gateway.definition(name, version)
+	definition, err := gateway.definition(ctx, name, version)
 	if err != nil {
 		return nil, err
 	}
@@ -703,27 +711,9 @@ func (gateway *Gateway) finishTask(ctx context.Context, workflowID, taskID, node
 	return gateway.dispatchTaskPublications(ctx)
 }
 
-func (gateway *Gateway) definition(name string, version int) (domain.WorkflowDef, error) {
-	gateway.mu.Lock()
-	defer gateway.mu.Unlock()
-	versions := gateway.definitions[name]
-	if len(versions) == 0 {
-		return domain.WorkflowDef{}, ErrWorkflowNotRegistered
-	}
-	if version > 0 {
-		definition, ok := versions[version]
-		if !ok {
-			return domain.WorkflowDef{}, ErrWorkflowNotRegistered
-		}
-		return definition, nil
-	}
-	latest := 0
-	for candidate := range versions {
-		if candidate > latest {
-			latest = candidate
-		}
-	}
-	return versions[latest], nil
+func (gateway *Gateway) definition(ctx context.Context, name string, version int) (domain.WorkflowDef, error) {
+	record, err := gateway.registeredWorkflow(ctx, name, version)
+	return record.Definition, err
 }
 
 func (gateway *Gateway) dispatchTaskPublications(ctx context.Context) error {
@@ -758,6 +748,8 @@ func (gateway *Gateway) serveHTTP(response http.ResponseWriter, request *http.Re
 	}
 	ctx := request.Context()
 	switch {
+	case request.URL.Path == "/v1/workflows/register":
+		gateway.serveRegistration(response, request)
 	case request.URL.Path == TaskReceivePath || request.URL.Path == TaskPollPath:
 		var input ReceiveWorkRequest
 		if !decodeJSON(response, request, &input) {
@@ -822,7 +814,14 @@ func (gateway *Gateway) serveGET(response http.ResponseWriter, request *http.Req
 		metrics, err := gateway.WorkflowMetrics(request.Context())
 		writeResult(response, metrics, err)
 	case path == "/v1/workflows":
-		writeResult(response, gateway.ListWorkflows(), nil)
+		workflows, err := gateway.ListWorkflows(request.Context())
+		if err != nil {
+			slog.Error("workflow catalog listing failed", "error", err)
+			err = errWorkflowCatalogUnavailable
+		}
+		writeResult(response, workflows, err)
+	case strings.HasPrefix(path, WorkflowInstancesPath) && strings.HasSuffix(path, "/contracts"):
+		gateway.serveContracts(response, request)
 	case path == "/v1/instances":
 		limit, limitErr := parseQueryInt(request, "limit", 25)
 		offset, offsetErr := parseQueryInt(request, "offset", 0)
@@ -844,7 +843,12 @@ func (gateway *Gateway) serveGET(response http.ResponseWriter, request *http.Req
 		writeResult(response, page, err)
 	case strings.HasPrefix(path, WorkflowInstancesPath):
 		name := strings.TrimPrefix(path, WorkflowInstancesPath)
-		definition, err := gateway.WorkflowDefinition(name, ParseVersion(request.URL.Query().Get("version")))
+		version, err := parseQueryInt(request, "version", 0)
+		if err != nil || version < 0 {
+			writeError(response, http.StatusBadRequest, "version must be a non-negative integer")
+			return
+		}
+		definition, err := gateway.definition(request.Context(), name, version)
 		writeResult(response, definition, err)
 	case strings.HasPrefix(path, "/v1/instances/"):
 		workflowID := strings.TrimPrefix(path, "/v1/instances/")
@@ -885,9 +889,9 @@ func writeResult(response http.ResponseWriter, value any, err error) {
 		switch {
 		case errors.Is(err, ErrWorkflowNotRegistered):
 			status = http.StatusNotFound
-		case errors.Is(err, store.ErrIdempotencyConflict), errors.Is(err, lease.ErrStaleToken), errors.Is(err, lease.ErrLeaseExpired), errors.Is(err, lease.ErrLeaseNotFound), errors.Is(err, ErrInvalidTaskLease):
+		case errors.Is(err, store.ErrDefinitionConflict), errors.Is(err, store.ErrIdempotencyConflict), errors.Is(err, lease.ErrStaleToken), errors.Is(err, lease.ErrLeaseExpired), errors.Is(err, lease.ErrLeaseNotFound), errors.Is(err, ErrInvalidTaskLease):
 			status = http.StatusConflict
-		case errors.Is(err, queue.ErrClosed):
+		case errors.Is(err, queue.ErrClosed), errors.Is(err, errWorkflowCatalogUnavailable):
 			status = http.StatusServiceUnavailable
 		}
 		writeError(response, status, err.Error())

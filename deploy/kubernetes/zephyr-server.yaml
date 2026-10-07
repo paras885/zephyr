@@ -69,6 +69,12 @@ spec:
                   name: zephyr-runtime
                   key: OIDC_CLIENT_SECRET
                   optional: true
+            - name: OIDC_CLI_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: zephyr-runtime
+                  key: OIDC_CLI_CLIENT_ID
+                  optional: true
             - name: OIDC_API_AUDIENCE
               valueFrom:
                 secretKeyRef:

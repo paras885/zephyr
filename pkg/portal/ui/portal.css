@@ -208,7 +208,9 @@ tbody tr.selected-run, tbody tr.selected-workflow { background: #edf5ee; }
   .panel-caption { display: none; }
 }
 @media (max-width: 900px) {
-  .token-field { display: none; }
+  .topbar { flex-wrap: wrap; padding: 10px 0; }
+  .topbar-actions { flex-wrap: wrap; }
+  .token-field > span { display: none; }
   .app-shell { grid-template-columns: 68px minmax(0, 1fr); }
   .sidebar { padding: 20px 9px 15px; }
   .brand { justify-content: center; padding: 0; font-size: 0; }

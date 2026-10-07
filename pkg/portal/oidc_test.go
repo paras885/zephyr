@@ -69,6 +69,21 @@ func TestOIDCLoginCallbackSessionAndScopedAPI(t *testing.T) {
 	if sessionCookie == nil || !sessionCookie.HttpOnly || !sessionCookie.Secure || sessionCookie.SameSite != http.SameSiteLaxMode {
 		t.Fatalf("callback did not create a secure session cookie: %#v", sessionCookie)
 	}
+	if len(sessionCookie.Value) != 43 || strings.Contains(sessionCookie.Value, "portal-access") {
+		t.Fatal("browser cookie must contain only an opaque 32-byte session ID")
+	}
+	if sessionCookie.MaxAge > int(time.Hour.Seconds()) {
+		t.Fatal("provider without refresh tokens must not create an eight-hour session")
+	}
+	for _, path := range []string{"/", "/portal.js", "/portal.css"} {
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		request.AddCookie(sessionCookie)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK || response.Body.Len() == 0 || apiCalls != 0 {
+			t.Fatalf("authenticated portal asset %s returned %d; api calls=%d", path, response.Code, apiCalls)
+		}
+	}
 
 	request := httptest.NewRequest(http.MethodGet, "/v1/workflows", nil)
 	request.AddCookie(sessionCookie)
@@ -157,6 +172,7 @@ type fakeOIDCClient struct {
 	exchangedCode     string
 	exchangedVerifier string
 	verifiedNonce     string
+	refresh           func(context.Context, string) (*oauth2.Token, error)
 }
 
 func (client *fakeOIDCClient) AuthorizationURL(state, nonce, verifier string) string {
@@ -173,6 +189,13 @@ func (client *fakeOIDCClient) Exchange(_ context.Context, code, verifier string)
 	client.exchangedCode = code
 	client.exchangedVerifier = verifier
 	return (&oauth2.Token{AccessToken: "portal-access", Expiry: time.Now().Add(time.Hour)}).WithExtra(map[string]any{"id_token": "verified-id"}), nil
+}
+
+func (client *fakeOIDCClient) Refresh(ctx context.Context, refreshToken string) (*oauth2.Token, error) {
+	if client.refresh != nil {
+		return client.refresh(ctx, refreshToken)
+	}
+	return &oauth2.Token{AccessToken: "portal-access", RefreshToken: "rotated-refresh", Expiry: time.Now().Add(time.Hour)}, nil
 }
 
 func (client *fakeOIDCClient) VerifyIDToken(_ context.Context, rawToken, nonce string) error {

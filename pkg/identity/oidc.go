@@ -31,6 +31,7 @@ type OIDCAuthenticator interface {
 	AuthorizationURL(state, nonce, verifier string) string
 	RedirectURL() string
 	Exchange(ctx context.Context, code, verifier string) (*oauth2.Token, error)
+	Refresh(ctx context.Context, refreshToken string) (*oauth2.Token, error)
 	VerifyIDToken(ctx context.Context, rawToken, expectedNonce string) error
 	Authorize(ctx context.Context, rawToken, requiredScope string) error
 }
@@ -84,8 +85,20 @@ func (client *OIDCClient) Exchange(ctx context.Context, code, verifier string) (
 	if err != nil {
 		return nil, fmt.Errorf("exchange OIDC authorization code: %w", err)
 	}
+
 	if token.AccessToken == "" {
 		return nil, fmt.Errorf("OIDC provider returned no access token")
+	}
+	return token, nil
+}
+
+func (client *OIDCClient) Refresh(ctx context.Context, refreshToken string) (*oauth2.Token, error) {
+	if refreshToken == "" {
+		return nil, fmt.Errorf("refresh token is required")
+	}
+	token, err := client.authorization.TokenSource(ctx, &oauth2.Token{RefreshToken: refreshToken}).Token()
+	if err != nil {
+		return nil, fmt.Errorf("refresh OIDC access token: %w", err)
 	}
 	return token, nil
 }

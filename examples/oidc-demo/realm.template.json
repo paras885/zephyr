@@ -1,0 +1,139 @@
+{
+  "realm": "zephyr",
+  "enabled": true,
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "accessTokenLifespan": 60,
+  "revokeRefreshToken": true,
+  "refreshTokenMaxReuse": 0,
+  "ssoSessionIdleTimeout": 900,
+  "roles": {
+    "realm": [
+      {"name": "zephyr:workflow:read"},
+      {"name": "zephyr:workflow:start"},
+      {"name": "zephyr:worker:execute"},
+      {"name": "zephyr:workflow:register"}
+    ]
+  },
+  "clientScopes": [
+    {
+      "name": "profile",
+      "protocol": "openid-connect",
+      "attributes": {"include.in.token.scope": "true"},
+      "protocolMappers": [
+        {"name": "username", "protocol": "openid-connect", "protocolMapper": "oidc-usermodel-property-mapper", "config": {"user.attribute": "username", "claim.name": "preferred_username", "jsonType.label": "String", "access.token.claim": "true", "id.token.claim": "true"}}
+      ]
+    },
+    {
+      "name": "email",
+      "protocol": "openid-connect",
+      "attributes": {"include.in.token.scope": "true"},
+      "protocolMappers": [
+        {"name": "email", "protocol": "openid-connect", "protocolMapper": "oidc-usermodel-property-mapper", "config": {"user.attribute": "email", "claim.name": "email", "jsonType.label": "String", "access.token.claim": "true", "id.token.claim": "true"}}
+      ]
+    },
+    {
+      "name": "zephyr-claims",
+      "protocol": "openid-connect",
+      "attributes": {"include.in.token.scope": "false"},
+      "protocolMappers": [
+        {
+          "name": "api-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {"included.custom.audience": "zephyr-api", "access.token.claim": "true", "id.token.claim": "false"}
+        },
+        {
+          "name": "permissions",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "config": {"claim.name": "roles", "jsonType.label": "String", "multivalued": "true", "access.token.claim": "true", "id.token.claim": "false"}
+        }
+      ]
+    },
+    {"name": "zephyr:workflow:read", "protocol": "openid-connect", "attributes": {"include.in.token.scope": "false"}},
+    {"name": "zephyr:workflow:start", "protocol": "openid-connect", "attributes": {"include.in.token.scope": "false"}}
+  ],
+  "clients": [
+    {
+      "clientId": "zephyr-cli",
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "fullScopeAllowed": true,
+      "attributes": {"oauth2.device.authorization.grant.enabled": "true"},
+      "defaultClientScopes": ["profile", "email", "zephyr-claims"]
+    },
+    {
+      "clientId": "zephyr-portal",
+      "secret": "__PORTAL_CLIENT_SECRET__",
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "fullScopeAllowed": true,
+      "redirectUris": ["https://zephyr.localhost:8443/auth/callback"],
+      "webOrigins": ["https://zephyr.localhost:8443"],
+      "attributes": {"pkce.code.challenge.method": "S256"},
+      "defaultClientScopes": ["profile", "email", "zephyr-claims"],
+      "optionalClientScopes": ["zephyr:workflow:read", "zephyr:workflow:start"]
+    },
+    {
+      "clientId": "checkout-app",
+      "secret": "__APP_CLIENT_SECRET__",
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "standardFlowEnabled": false,
+      "serviceAccountsEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "fullScopeAllowed": true,
+      "defaultClientScopes": ["zephyr-claims"]
+    },
+    {
+      "clientId": "checkout-worker",
+      "secret": "__WORKER_CLIENT_SECRET__",
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "standardFlowEnabled": false,
+      "serviceAccountsEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "fullScopeAllowed": true,
+      "defaultClientScopes": ["zephyr-claims"]
+    }
+  ],
+  "users": [
+    {
+      "username": "operator",
+      "enabled": true,
+      "email": "operator@example.test",
+      "emailVerified": true,
+      "firstName": "Demo",
+      "lastName": "Operator",
+      "credentials": [{"type": "password", "value": "demo-local-only", "temporary": false}],
+      "realmRoles": ["zephyr:workflow:read", "zephyr:workflow:start", "zephyr:workflow:register"]
+    },
+    {
+      "username": "viewer",
+      "enabled": true,
+      "email": "viewer@example.test",
+      "emailVerified": true,
+      "firstName": "Demo",
+      "lastName": "Viewer",
+      "credentials": [{"type": "password", "value": "demo-local-only", "temporary": false}],
+      "realmRoles": ["zephyr:workflow:read"]
+    },
+    {
+      "username": "service-account-checkout-app",
+      "enabled": true,
+      "serviceAccountClientId": "checkout-app",
+      "realmRoles": ["zephyr:workflow:read", "zephyr:workflow:start"]
+    },
+    {
+      "username": "service-account-checkout-worker",
+      "enabled": true,
+      "serviceAccountClientId": "checkout-worker",
+      "realmRoles": ["zephyr:worker:execute"]
+    }
+  ]
+}

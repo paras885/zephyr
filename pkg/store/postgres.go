@@ -33,6 +33,9 @@ var postgresLeaseMigration []byte
 //go:embed migrations/0006_retention.sql
 var postgresRetentionMigration []byte
 
+//go:embed migrations/0007_portal_registry.sql
+var postgresPortalRegistryMigration []byte
+
 const postgresMigrationVersion = 1
 
 type PostgresStore struct {
@@ -177,6 +180,9 @@ func MigratePostgres(ctx context.Context, db *sql.DB) error {
 		if _, err := transaction.ExecContext(ctx, `INSERT INTO schema_migrations (version) VALUES (6) ON CONFLICT DO NOTHING`); err != nil {
 			return fmt.Errorf("record PostgreSQL retention migration: %w", err)
 		}
+	}
+	if err := applyPortalRegistryMigration(ctx, transaction, postgresPortalRegistryMigration); err != nil {
+		return err
 	}
 	if err := transaction.Commit(); err != nil {
 		return fmt.Errorf("commit PostgreSQL migration: %w", err)

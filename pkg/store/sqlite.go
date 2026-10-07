@@ -34,6 +34,9 @@ var sqliteTaskLeaseMigration []byte
 //go:embed migrations/0006_sqlite_retention.sql
 var sqliteRetentionMigration []byte
 
+//go:embed migrations/0007_sqlite_portal_registry.sql
+var sqlitePortalRegistryMigration []byte
+
 type SQLiteStore struct {
 	db             *sql.DB
 	workflowLockMu sync.Mutex
@@ -175,6 +178,9 @@ func (store *SQLiteStore) Migrate(ctx context.Context) error {
 		if _, err := transaction.ExecContext(ctx, `INSERT INTO schema_migrations (version) VALUES (6) ON CONFLICT DO NOTHING`); err != nil {
 			return fmt.Errorf("record SQLite retention migration: %w", err)
 		}
+	}
+	if err := applyPortalRegistryMigration(ctx, transaction, sqlitePortalRegistryMigration); err != nil {
+		return err
 	}
 	if err := transaction.Commit(); err != nil {
 		return fmt.Errorf("commit SQLite migration: %w", err)

@@ -1,0 +1,13 @@
+namespace consumer.checkout;
+
+type CheckoutInput { order_id: string customer_email: string }
+type TaskOutput { status: string }
+
+task AuthorizePayment(input: CheckoutInput) -> TaskOutput { timeout 30s }
+task SendReceipt(input: CheckoutInput) -> TaskOutput { timeout 15s }
+
+workflow Checkout(input: CheckoutInput) -> TaskOutput {
+    step authorize = AuthorizePayment({ order_id: input.order_id, customer_email: input.customer_email });
+    step receipt = SendReceipt({ order_id: input.order_id, customer_email: input.customer_email });
+    return TaskOutput { status: receipt.result.status };
+}

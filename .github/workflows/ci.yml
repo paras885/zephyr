@@ -32,6 +32,12 @@ jobs:
         run: go build ./...
       - name: Vet
         run: go vet ./...
+      - name: Checkout consumer application
+        run: |
+          go run ./cmd/zephyr workflow artifacts --file examples/checkout/workflows/checkout.zephyr --output examples/checkout/generated --force
+          cd examples/checkout
+          go test -race -count=1 ./...
+          go vet ./...
       - name: Package and command race tests
         run: go test -race -count=1 ./pkg/... ./cmd/...
       - name: Testcontainers integration tests
@@ -62,6 +68,48 @@ jobs:
       - run: npm exec --prefix test/browser -- playwright install --with-deps chromium
       - run: npm test --prefix test/browser
       - run: npm audit --prefix test/browser --audit-level=high
+
+  oidc-demo:
+    name: Real-provider OIDC and service identity flow
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: test/browser/package-lock.json
+      - run: npm ci --prefix test/browser
+      - run: npm exec --prefix test/browser -- playwright install --with-deps chromium
+      - name: Prepare local certificate and disposable identity secrets
+        run: bash examples/oidc-demo/setup.sh
+      - name: Start isolated OIDC stack
+        run: docker compose --env-file examples/oidc-demo/.local/demo.env -f examples/oidc-demo/compose.yaml up --build --wait --wait-timeout 180 -d
+      - name: Verify refresh, permissions, runtime registration, restart, and logout
+        run: node examples/oidc-demo/verify.mjs
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify unified CLI device sign-in, publication and refresh
+        run: |
+          echo '127.0.0.1 zephyr.localhost identity.localhost checkout.localhost' | sudo tee -a /etc/hosts
+          node examples/oidc-demo/verify-cli.mjs
+      - name: Upload identity verification report
+        if: always() && hashFiles('examples/oidc-demo/.local/verification-report.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: oidc-verification-${{ github.run_id }}
+          path: |
+            examples/oidc-demo/.local/verification-report.json
+            examples/oidc-demo/.local/cli-verification-report.json
+      - name: Show diagnostics on failure
+        if: failure()
+        run: docker compose --env-file examples/oidc-demo/.local/demo.env -f examples/oidc-demo/compose.yaml logs --tail 100
+      - name: Stop disposable OIDC stack
+        if: always() && hashFiles('examples/oidc-demo/.local/demo.env') != ''
+        run: docker compose --env-file examples/oidc-demo/.local/demo.env -f examples/oidc-demo/compose.yaml down
 
   image:
     name: Container image build and scan

@@ -15,14 +15,14 @@
         <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
         <span>zephyr<span class="brand-period">.</span></span>
       </a>
-      <div class="workspace-label">WORKSPACE</div>
-      <div class="workspace-switch"><span class="workspace-dot"></span><span id="workspace-name">Local engine</span><span class="chevron">⌄</span></div>
+      <div class="workspace-label">PLATFORM ENDPOINT</div>
+      <div class="workspace-switch" title="This portal connects to the platform serving this page; this is not a workspace selector."><span class="workspace-dot"></span><span id="workspace-name">Current platform</span></div>
       <nav class="primary-nav" aria-label="Primary navigation">
         <button class="nav-link active" data-view="overview"><span class="nav-icon">◫</span><span>Overview</span><span class="nav-count" id="nav-run-count">0</span></button>
         <button class="nav-link" data-view="workflows"><span class="nav-icon">⌘</span><span>Workflows</span></button>
       </nav>
       <div class="sidebar-bottom">
-        <div class="connection-card"><span class="connection-led"></span><span><strong>Engine connected</strong><small id="connection-endpoint">checking API</small></span></div>
+        <div class="connection-card"><span class="connection-led"></span><span><strong id="connection-status">Checking API</strong><small id="connection-endpoint">checking API</small></span></div>
         <div class="sidebar-foot">ZEPHYR CONTROL PLANE <span>v0.1</span></div>
       </div>
     </aside>
@@ -31,10 +31,11 @@
       <header class="topbar">
         <div class="breadcrumbs"><span>Operations</span><span class="crumb-slash">/</span><strong id="breadcrumb-current">Overview</strong></div>
         <div class="topbar-actions">
-          <label class="token-field" id="token-field"><span>LOCAL API TOKEN</span><input id="api-token" type="password" autocomplete="off" placeholder="Optional" aria-label="Local development API token"></label>
+          <label class="token-field" id="token-field" title="For development only: enter the platform's ZEPHYR_SERVER_TOKEN. Production uses sign-in instead."><span>DEV API TOKEN</span><input id="api-token" type="password" autocomplete="off" placeholder="Server token" aria-label="Development API token"></label>
           <button class="button button-quiet" id="sign-out-button" type="button" hidden>Sign out</button>
           <button class="button button-quiet" id="refresh-button" type="button"><span class="refresh-glyph">↻</span> Refresh</button>
-          <button class="button button-primary" id="start-button" type="button"><span>＋</span> Start workflow</button>
+          <button class="button button-quiet" id="register-button" type="button" hidden>Register workflow</button>
+          <button class="button button-primary" id="start-button" type="button" hidden><span>＋</span> Start workflow</button>
         </div>
       </header>
 
@@ -101,6 +102,21 @@
     </main>
   </div>
 
+  <dialog id="register-dialog" class="start-dialog">
+    <form method="dialog" class="dialog-close-row"><button class="close-button" aria-label="Close registration">×</button></form>
+    <h2>Register a workflow</h2>
+    <p class="dialog-intro">Validate and persist an immutable name/version without restarting the platform. Deploy matching worker implementations separately.</p>
+    <form id="register-form">
+      <label class="form-label" for="definition-file">Workflow file (.zephyr)</label>
+      <input id="definition-file" type="file" accept=".zephyr">
+      <label class="form-label" for="definition-source">Workflow source</label>
+      <textarea id="definition-source" rows="12" required spellcheck="false"></textarea>
+      <label class="form-label" for="definition-version">Version</label>
+      <input id="definition-version" type="number" min="1" step="1" value="1" required>
+      <div class="form-error" id="registration-error" hidden></div>
+      <div class="dialog-actions"><button class="button button-primary" id="confirm-register" type="submit">Register and generate contracts</button></div>
+    </form>
+  </dialog>
   <dialog id="start-dialog" class="start-dialog">
     <form method="dialog" class="dialog-close-row"><button class="close-button" aria-label="Close dialog">×</button></form>
     <div class="section-kicker">NEW EXECUTION</div>

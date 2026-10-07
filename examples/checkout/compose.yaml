@@ -1,0 +1,19 @@
+services:
+  server:
+    volumes:
+      - ../examples/checkout/workflows:/app/workflows:ro
+  checkout-app:
+    build:
+      context: ..
+      dockerfile: examples/checkout/Dockerfile
+    environment:
+      ZEPHYR_ENDPOINT: http://server:8080
+      ZEPHYR_TOKEN: ${ZEPHYR_SERVER_TOKEN:-zephyr-compose-local-only}
+      AMQP_URL: amqp://zephyr:zephyr-local-only@rabbitmq:5672/
+      APP_ADDR: 0.0.0.0:8090
+    ports:
+      - "127.0.0.1:8090:8090"
+    depends_on:
+      server:
+        condition: service_healthy
+    restart: unless-stopped

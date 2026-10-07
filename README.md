@@ -2,6 +2,48 @@
 
 Zephyr is a workflow engine with a typed `.zephyr` DSL, Go client/worker SDKs, HTTP control plane, and RabbitMQ task transport.
 
+## Integrate As A Platform Consumer
+
+For real OIDC browser sign-in with refresh, permission-aware controls, live workflow
+registration, HTTPS, and separate service identities, see the
+[local production-style identity demo](examples/oidc-demo/README.md).
+
+The [checkout consumer application](examples/checkout/README.md) provides a separate
+Go module with a consumer-owned workflow, generated client/models/task interfaces,
+an application UI/API, and a worker that publishes completions through RabbitMQ.
+Run the platform and application from the repository root:
+
+```sh
+docker compose -f deploy/compose.yaml -f examples/checkout/compose.yaml up --build --wait -d
+```
+
+Open the application at `http://127.0.0.1:8090` and the platform UI at
+`http://127.0.0.1:8080`. In the development platform UI, enter
+`zephyr-compose-local-only` in **Dev API Token**; this matches the Compose
+`ZEPHYR_SERVER_TOKEN`. A 401 means missing/invalid API authentication, not that
+PostgreSQL or RabbitMQ is down. Production uses OIDC sign-in instead.
+The UI's platform endpoint denotes the server serving the page; it is not a
+workspace/tenant selector.
+
+Workflows can be bootstrapped from files or registered at runtime using the
+portal's **Register workflow** action or `POST /v1/workflows/register`. Registration
+accepts `{ "source": "<.zephyr source>", "version": 1 }` and returns
+`{ "name": "...", "version": 1, "files": { "<filename>": "<content>" } }`.
+It requires `zephyr:workflow:register` in OIDC mode. Definitions and source are
+durable and immutable per name/version; identical registration is idempotent,
+while conflicting content returns 409. Register a new positive version for changes.
+`GET /v1/workflows/{name}/contracts?version=1` downloads a ZIP with generated
+Go/Python/TypeScript contracts and a non-secret configuration template (read scope).
+For definitions originally bootstrapped without source, register the matching
+source/version once to enable downloads.
+
+`zephyr workflow artifacts --version 1` also generates contracts locally;
+`zephyr workflow publish` registers and saves contracts in one operation. Neither
+issues credentials or deploys task implementations. Configure endpoint/service
+identity and run your application's workers separately.
+A Helm chart is not yet available; Kubernetes support uses
+[deploy/kubernetes](deploy/kubernetes).
+
 ## Local Operations Portal
 
 Local development requires Go 1.27.1. Docker is optional for running the local server and is required only for PostgreSQL/RabbitMQ Testcontainers tests.
@@ -12,15 +54,15 @@ Run the server from the repository root. It compiles the `.zephyr` definitions f
 go run ./cmd/zephyr-server
 ```
 
-Open `http://127.0.0.1:8080`. The server uses SQLite at `./zephyr.db` for execution history. Definitions are loaded from files at startup; this command does not upload definitions or provide a CLI for managing them.
+Open `http://127.0.0.1:8080`. The server uses SQLite at `./zephyr.db` for execution history and the runtime catalog. Files bootstrap the catalog at startup; additional workflows can be registered through the portal/API without restarting.
 
 To generate client, model, and worker scaffolding for a definition:
 
 ```sh
-go run ./cmd/zephyr-gen -input workflows/checkout.zephyr -output ./generated
+go run ./cmd/zephyr workflow artifacts --file workflows/checkout.zephyr --output ./generated
 ```
 
-`zephyr-gen` emits Go models, worker interfaces, a typed workflow client, and `.env.example`, plus Python models/worker stubs and TypeScript interfaces. It does not deploy the generated code or run workers. For a different local address, database file, or definitions directory, use:
+`zephyr workflow artifacts` emits Go models, worker interfaces, a typed workflow client, and `.env.example`, plus Python models/worker stubs and TypeScript interfaces. It does not deploy the generated code or run workers. See the [consumer CLI guide](docs/CLI.md) for generation, validation, publishing, runs, and refreshable browser sign-in. For a different local address, database file, or definitions directory, use:
 
 ```sh
 go run ./cmd/zephyr-server -addr 127.0.0.1:9090 -db ./zephyr-local.db -workflows ./workflows
@@ -52,6 +94,7 @@ Supported environment variables and corresponding flags:
 | `AMQP_URL` | `-amqp-url` | RabbitMQ connection URL; required with `DATABASE_URL` for distributed mode |
 | `OIDC_ISSUER_URL` | — | OIDC discovery issuer; required in distributed mode unless the explicit development-only static-auth switch is enabled |
 | `OIDC_CLIENT_ID` | — | OIDC portal client ID |
+| `OIDC_CLI_CLIENT_ID` | — | Public device-flow CLI client advertised at `/auth/config`; defaults to `zephyr-cli` (provision separately at provider) |
 | `OIDC_CLIENT_SECRET` | — | Optional secret for confidential OIDC clients; PKCE is used either way |
 | `OIDC_API_AUDIENCE` | — | Expected audience for signed worker/API access tokens |
 | `OIDC_REDIRECT_URL` | — | Absolute public callback URL ending in `/auth/callback` |
@@ -168,9 +211,9 @@ The Deployment has two replicas, readiness/liveness/startup probes, a 30-second 
 
 The distributed server stores leases and fencing tokens in PostgreSQL, serializes decider advancement with PostgreSQL advisory locks, and recovers retry/delay deadlines and expired leases from persisted state. The two-instance integration test exercises independent gateways over shared PostgreSQL and RabbitMQ. The timer heap and broker mailbox are still process-local accelerators; persisted workflow deadlines, lease rows, and task IDs are the recovery authority.
 
-These artifacts provide a runnable distributed deployment path, not a claim of production readiness. Distributed mode requires OIDC discovery, signed access tokens with the configured audience, protected portal sessions, and endpoint scopes; static bearer auth is accepted only when explicitly enabled with `ZEPHYR_ENV=development`. The server does not implement provider logout or token refresh; sessions expire with the access token and users sign in again. Put the HTTP service behind TLS and configure the public OIDC callback URL consistently with the ingress/proxy.
+These artifacts provide a runnable distributed deployment path, not a claim of production readiness. Distributed mode requires OIDC discovery, signed access tokens with the configured audience, protected portal sessions, and endpoint scopes; static bearer auth is accepted only when explicitly enabled with `ZEPHYR_ENV=development`. Portal access/refresh tokens are encrypted server-side in PostgreSQL; an opaque Secure HttpOnly cookie identifies the session. Refresh rotation is serialized across replicas, with an absolute eight-hour session limit; provider revocation/expiry requires sign-in again. Providers that do not issue refresh tokens retain access-token-limited sessions. Logout revokes the platform session but does not end provider SSO. Put the HTTP service behind TLS and configure the public OIDC callback URL consistently with the ingress/proxy.
 
-Workflow definitions are baked into the image and loaded at process startup. Treat the workflow bundle as immutable for each image release, deploy the same bundle to every replica, and roll out a new image to change definitions; there is no runtime upload or synchronized reload.
+Startup workflow bundles and runtime registrations share the PostgreSQL catalog. All replicas immediately resolve registered versions from that catalog; in-flight runs retain their original definition snapshots. Treat each name/version as immutable, including bootstrapped files; changes need a new version. Apply database migrations (including migration 7 for source/session storage) before starting updated replicas. Use identical cookie encryption/signing keys across replicas, protect them in a secret manager, and plan key rotation; replacing keys invalidates existing sessions.
 
 PostgreSQL and RabbitMQ are external operational dependencies in Kubernetes. Provision, secure, back up, monitor, upgrade, and provide network access to them separately. The Compose credentials and images are a local smoke setup, not production settings. Kubernetes Secret references avoid embedding credentials in these manifests but do not themselves provide secret encryption, access policy, rotation, or an external secret manager.
 

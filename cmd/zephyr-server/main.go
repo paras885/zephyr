@@ -61,6 +61,7 @@ func main() {
 				DevelopmentStaticAuth: strings.EqualFold(os.Getenv("ZEPHYR_DEV_STATIC_AUTH"), "true"),
 				OIDCIssuerURL:         os.Getenv("OIDC_ISSUER_URL"),
 				OIDCClientID:          os.Getenv("OIDC_CLIENT_ID"),
+				OIDCCLIClientID:       os.Getenv("OIDC_CLI_CLIENT_ID"),
 				OIDCClientSecret:      os.Getenv("OIDC_CLIENT_SECRET"),
 				OIDCAudience:          os.Getenv("OIDC_API_AUDIENCE"),
 				OIDCRedirectURL:       os.Getenv("OIDC_REDIRECT_URL"),

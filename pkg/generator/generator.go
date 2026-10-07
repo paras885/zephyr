@@ -13,14 +13,25 @@ import (
 type Files map[string][]byte
 
 func Generate(source string) (Files, error) {
+	return GenerateVersion(source, 1)
+}
+
+func GenerateVersion(source string, version int) (Files, error) {
 	file, err := parser.Parse(source)
 	if err != nil {
 		return nil, err
 	}
-	return GenerateFile(file)
+	return generateFileVersion(file, version)
 }
 
 func GenerateFile(file *ast.File) (Files, error) {
+	return generateFileVersion(file, 1)
+}
+
+func generateFileVersion(file *ast.File, version int) (Files, error) {
+	if version < 1 {
+		return nil, fmt.Errorf("workflow version must be positive")
+	}
 	if file == nil {
 		return nil, fmt.Errorf("DSL file is required")
 	}
@@ -35,7 +46,7 @@ func GenerateFile(file *ast.File) (Files, error) {
 	if err != nil {
 		return nil, err
 	}
-	clients, err := generateClients(file)
+	clients, err := generateClients(file, version)
 	if err != nil {
 		return nil, err
 	}
@@ -135,7 +146,7 @@ func generateWorkers(file *ast.File) ([]byte, error) {
 	return format.Source([]byte(source.String()))
 }
 
-func generateClients(file *ast.File) ([]byte, error) {
+func generateClients(file *ast.File, version int) ([]byte, error) {
 	var source strings.Builder
 	source.WriteString("package generated\n")
 	if len(file.Workflows) == 0 {
@@ -155,10 +166,10 @@ func generateClients(file *ast.File) ([]byte, error) {
 		source.WriteString("\tconfig, err := zephyrclient.ConfigFromEnv()\n\tif err != nil {\n\t\treturn nil, err\n\t}\n")
 		fmt.Fprintf(&source, "\treturn New%s(config)\n}\n\n", clientName)
 		fmt.Fprintf(&source, "func (client *%s) %s(ctx context.Context, input %s) (string, error) {\n", clientName, methodName, exportName(inputType))
-		fmt.Fprintf(&source, "\trun, err := client.client.StartWorkflow(ctx, %q, 1, input)\n", workflow.Name)
+		fmt.Fprintf(&source, "\trun, err := client.client.StartWorkflow(ctx, %q, %d, input)\n", workflow.Name, version)
 		source.WriteString("\tif err != nil {\n\t\treturn \"\", err\n\t}\n\treturn run.ID, nil\n}\n\n")
 		fmt.Fprintf(&source, "func (client *%s) %sWithIdempotencyKey(ctx context.Context, input %s, key string) (string, error) {\n", clientName, methodName, exportName(inputType))
-		fmt.Fprintf(&source, "\trun, err := client.client.StartWorkflowWithIdempotencyKey(ctx, %q, 1, input, key)\n", workflow.Name)
+		fmt.Fprintf(&source, "\trun, err := client.client.StartWorkflowWithIdempotencyKey(ctx, %q, %d, input, key)\n", workflow.Name, version)
 		source.WriteString("\tif err != nil {\n\t\treturn \"\", err\n\t}\n\treturn run.ID, nil\n}\n\n")
 		fmt.Fprintf(&source, "func (client *%s) Get%sResult(ctx context.Context, workflowID string) (%s, error) {\n", clientName, exportName(workflow.Name), outputType)
 		source.WriteString("\trun, err := client.client.GetWorkflowRun(ctx, workflowID)\n\tif err != nil {\n\t\treturn ")

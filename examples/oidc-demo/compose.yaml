@@ -1,0 +1,123 @@
+name: zephyr-oidc
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: zephyr
+      POSTGRES_USER: zephyr
+      POSTGRES_PASSWORD: zephyr-oidc-local-only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zephyr -d zephyr"]
+      interval: 5s
+      retries: 30
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+  rabbitmq:
+    image: rabbitmq:4.1-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: zephyr
+      RABBITMQ_DEFAULT_PASS: zephyr-oidc-local-only
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      retries: 30
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4.0
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_HOSTNAME: https://identity.localhost:8443
+      KC_PROXY_HEADERS: xforwarded
+      KC_HEALTH_ENABLED: "true"
+      KC_BOOTSTRAP_ADMIN_USERNAME: demo-admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?Run setup.sh first}
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/9000; printf \"GET /health/ready HTTP/1.0\\r\\n\\r\\n\" >&3; grep -q \"200 OK\" <&3'"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+    volumes:
+      - ./.local/realm.json:/opt/keycloak/data/import/realm.json:ro
+      - keycloak-data:/opt/keycloak/data
+  proxy:
+    image: nginx:1.28-alpine
+    ports:
+      - "127.0.0.1:8443:8443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./.local:/tls:ro
+    networks:
+      default:
+        aliases: [identity.localhost, zephyr.localhost, checkout.localhost]
+    depends_on:
+      keycloak:
+        condition: service_healthy
+  migrate:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["-migrate-only"]
+    environment:
+      DATABASE_URL: postgres://zephyr:zephyr-oidc-local-only@postgres:5432/zephyr?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+  server:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgres://zephyr:zephyr-oidc-local-only@postgres:5432/zephyr?sslmode=disable
+      AMQP_URL: amqp://zephyr:zephyr-oidc-local-only@rabbitmq:5672/
+      ZEPHYR_ENV: production
+      ZEPHYR_HTTP_ADDR: 0.0.0.0:8080
+      OIDC_ISSUER_URL: https://identity.localhost:8443/realms/zephyr
+      OIDC_CLIENT_ID: zephyr-portal
+      OIDC_CLIENT_SECRET: ${PORTAL_CLIENT_SECRET:?Run setup.sh first}
+      OIDC_API_AUDIENCE: zephyr-api
+      OIDC_REDIRECT_URL: https://zephyr.localhost:8443/auth/callback
+      OIDC_COOKIE_HASH_KEY: ${OIDC_COOKIE_HASH_KEY:?Run setup.sh first}
+      OIDC_COOKIE_BLOCK_KEY: ${OIDC_COOKIE_BLOCK_KEY:?Run setup.sh first}
+      OIDC_SCOPES: zephyr:workflow:read zephyr:workflow:start
+      SSL_CERT_FILE: /tls/demo.crt
+    volumes:
+      - ./.local/demo.crt:/tls/demo.crt:ro
+      - ../checkout/workflows:/app/workflows:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+      proxy:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8080/readyz >/dev/null"]
+      interval: 5s
+      retries: 30
+    restart: unless-stopped
+  checkout-app:
+    build:
+      context: ../..
+      dockerfile: examples/checkout/Dockerfile
+    environment:
+      ZEPHYR_ENDPOINT: https://zephyr.localhost:8443
+      OAUTH_TOKEN_URL: https://identity.localhost:8443/realms/zephyr/protocol/openid-connect/token
+      OAUTH_APP_CLIENT_ID: checkout-app
+      OAUTH_APP_CLIENT_SECRET: ${APP_CLIENT_SECRET:?Run setup.sh first}
+      OAUTH_WORKER_CLIENT_ID: checkout-worker
+      OAUTH_WORKER_CLIENT_SECRET: ${WORKER_CLIENT_SECRET:?Run setup.sh first}
+      AMQP_URL: amqp://zephyr:zephyr-oidc-local-only@rabbitmq:5672/
+      APP_ADDR: 0.0.0.0:8090
+      SSL_CERT_FILE: /tls/demo.crt
+    volumes:
+      - ./.local/demo.crt:/tls/demo.crt:ro
+    depends_on:
+      server:
+        condition: service_healthy
+    restart: unless-stopped
+volumes:
+  postgres-data:
+  rabbitmq-data:
+  keycloak-data:

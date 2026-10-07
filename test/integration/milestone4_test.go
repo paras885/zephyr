@@ -64,6 +64,11 @@ var _ RunWorker = runWorker{}
 	if err := os.WriteFile(filepath.Join(workspace, "worker_test.go"), []byte(worker), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	dependencies := exec.Command("go", "mod", "tidy")
+	dependencies.Dir = workspace
+	if output, err := dependencies.CombinedOutput(); err != nil {
+		t.Fatalf("generated module dependencies failed: %v\n%s", err, output)
+	}
 	command := exec.Command("go", "test", "./...")
 	command.Dir = workspace
 	if output, err := command.CombinedOutput(); err != nil {

@@ -20,6 +20,7 @@ type MemoryStore struct {
 	taskPublications map[string]*memoryTaskPublication
 	leases           map[string]lease.Lease
 	fencingToken     uint64
+	definitions      map[string]map[int]RegisteredWorkflow
 }
 
 type memoryTaskPublication struct {
@@ -37,6 +38,7 @@ func NewMemoryStore() *MemoryStore {
 		idempotency:      make(map[idempotencyIdentity]idempotencyClaim),
 		taskPublications: make(map[string]*memoryTaskPublication),
 		leases:           make(map[string]lease.Lease),
+		definitions:      make(map[string]map[int]RegisteredWorkflow),
 	}
 }
 

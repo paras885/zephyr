@@ -1,7 +1,7 @@
 .git
 .gitignore
 .DS_Store
-zephyr-gen
+zephyr
 zephyr.db
 zephyr.db-*
 *.db
@@ -9,3 +9,4 @@ zephyr.db-*
 test/
 **/*_test.go
 deploy/
+examples/oidc-demo/.local/

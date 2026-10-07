@@ -6,6 +6,22 @@
   const tokenField = byId('token-field');
   const signOutButton = byId('sign-out-button');
   let oidcMode = false;
+  let canStart = false;
+  let canRegister = false;
+
+  function applyPermissions(permissions) {
+    const changed = canStart !== permissions.start || canRegister !== permissions.register;
+    canStart = permissions.start;
+    canRegister = permissions.register;
+    byId('start-button').hidden = !canStart;
+    byId('register-button').hidden = !canRegister;
+    if (!canStart) byId('start-dialog').close();
+    if (!canRegister) byId('register-dialog').close();
+    if (changed) {
+      renderWorkflows();
+      document.querySelectorAll('.definition-start').forEach(button => { button.hidden = !canStart; });
+    }
+  }
 
   function escapeHTML(value) {
     return String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
@@ -27,6 +43,9 @@
       window.location.assign('/auth/login');
       throw new Error('Your sign-in session expired');
     }
+    if (response.status === 401) {
+      throw new Error('API authentication required. Enter the platform ZEPHYR_SERVER_TOKEN in Dev API Token.');
+    }
     if (!response.ok) throw new Error(body?.error || `Request failed (${response.status})`);
     return body;
   }
@@ -39,11 +58,16 @@
         oidcMode = true;
         tokenField.hidden = true;
         signOutButton.hidden = false;
+        applyPermissions({
+          start: session.permissions?.['zephyr:workflow:start'] === true,
+          register: session.permissions?.['zephyr:workflow:register'] === true
+        });
         return true;
       }
     }
     if (response.status === 404 || response.ok) {
       tokenInput.value = sessionStorage.getItem('zephyr-token') || '';
+      applyPermissions({ start: true, register: true });
       return true;
     }
     if (response.status === 401) {
@@ -95,6 +119,7 @@
     state.refreshing = true;
     byId('refresh-button').classList.add('is-loading');
     try {
+      if (oidcMode && !await configureAuthentication()) return;
       const workflowData = await api('/v1/workflows');
       const workflows = Array.isArray(workflowData) ? workflowData : [];
       const workflowSignature = JSON.stringify(workflows);
@@ -113,9 +138,12 @@
       updateMetrics();
       if (state.selectedRun) await loadDetail(state.selectedRun, true);
       byId('connection-endpoint').textContent = window.location.host;
+      byId('connection-status').textContent = 'Platform connected';
+      byId('workspace-name').textContent = window.location.host;
       byId('updated-at').textContent = `Updated ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`;
     } catch (error) {
       byId('connection-endpoint').textContent = 'API unavailable';
+      byId('connection-status').textContent = 'API not connected';
       byId('updated-at').textContent = 'Connection error';
       showToast(error.message || 'Could not load workflow data', true);
     } finally {
@@ -149,7 +177,7 @@
         <td><button class="workflow-name" data-workflow="${escapeHTML(workflow.name)}">${escapeHTML(workflow.name)}</button><span class="workflow-sub">${workflow.versions?.length || 0} definition${workflow.versions?.length === 1 ? '' : 's'}</span></td>
         <td><span class="version-tag">v${escapeHTML(workflow.latest_version)}</span></td>
         <td><span class="step-count">${escapeHTML(workflow.task_count)} tasks</span></td>
-        <td><button class="row-action" data-start-workflow="${escapeHTML(workflow.name)}" aria-label="Start ${escapeHTML(workflow.name)}">＋</button></td>
+        <td>${canStart ? `<button class="row-action" data-start-workflow="${escapeHTML(workflow.name)}" aria-label="Start ${escapeHTML(workflow.name)}">＋</button>` : ''}</td>
       </tr>`;
     }).join('');
   }
@@ -232,15 +260,21 @@
         <div class="detail-meta"><div><span>VERSIONS</span><strong>${versions.map((version) => `v${version}`).join(' · ')}</strong></div><div><span>START NODES</span><strong>${starts.map(escapeHTML).join(', ') || '—'}</strong></div><div><span>GRAPH NODES</span><strong>${Object.keys(nodes).length}</strong></div><div><span>RECENT RUNS</span><strong>${state.total}</strong></div></div>
         <section class="detail-section"><div class="detail-section-heading"><h3>Execution graph</h3><span>${Object.keys(nodes).length} nodes</span></div><div class="task-list">${nodeRows || '<div class="table-empty">No graph nodes</div>'}</div></section>
         <section class="detail-section"><details class="definition-json"><summary>Full compiled definition</summary><pre class="json-view">${escapeHTML(JSON.stringify(workflow, null, 2))}</pre></details></section>
-        <section class="detail-section"><button class="button button-primary definition-start" type="button">Start this workflow <span>→</span></button></section>
+        <section class="detail-section"><button class="button button-primary definition-start" type="button" ${canStart ? '' : 'hidden'}>Start this workflow <span>→</span></button>
+        <button class="button button-quiet definition-contracts" type="button">Download contracts</button></section>
       </div>`;
       root.querySelector('.definition-start').addEventListener('click', () => openStartDialog(name));
+      root.querySelector('.definition-contracts').addEventListener('click', () => downloadContracts(name, workflow.version || workflow.Version));
     } catch (error) {
       showToast(error.message || 'Could not load workflow definition', true);
     }
   }
 
   function openStartDialog(workflowName = '') {
+    if (!canStart) {
+      showToast('Your account does not have workflow start permission', true);
+      return;
+    }
     const select = byId('workflow-select');
     select.innerHTML = state.workflows.map((workflow) => `<option value="${escapeHTML(workflow.name)}">${escapeHTML(workflow.name)}</option>`).join('');
     if (!state.workflows.length) {
@@ -261,6 +295,60 @@
   }
 
   byId('start-button').addEventListener('click', () => openStartDialog());
+  async function downloadContracts(name, version) {
+    try {
+      const response = await fetch(`/v1/workflows/${encodeURIComponent(name)}/contracts?version=${version}`, { headers: tokenHeaders() });
+      if (!response.ok) {
+        const json = (response.headers.get('content-type') || '').includes('application/json');
+        const body = json ? await response.json() : await response.text();
+        throw new Error(body.error || (typeof body === 'string' && body.trim()) || `Contract download failed (${response.status})`);
+      }
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'workflow-contracts.zip';
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (error) {
+      showToast(error.message || 'Could not download contracts', true);
+    }
+  }
+  byId('register-button').addEventListener('click', () => {
+    if (!canRegister) return;
+    byId('registration-error').hidden = true;
+    byId('register-dialog').showModal();
+  });
+  byId('definition-file').addEventListener('change', async event => {
+    const file = event.target.files[0];
+    if (!file) return;
+    try {
+      byId('definition-source').value = await file.text();
+    } catch (error) {
+      byId('registration-error').textContent = error.message || 'Could not read workflow file';
+      byId('registration-error').hidden = false;
+    }
+  });
+  byId('register-form').addEventListener('submit', async event => {
+    event.preventDefault();
+    if (!canRegister) return;
+    const button = byId('confirm-register');
+    button.disabled = true;
+    try {
+      const result = await api('/v1/workflows/register', {
+        method: 'POST',
+        body: JSON.stringify({ source: byId('definition-source').value, version: Number(byId('definition-version').value) })
+      });
+      byId('register-dialog').close();
+      await refresh();
+      showToast(`Registered ${result.name} v${result.version}`);
+      await downloadContracts(result.name, result.version);
+    } catch (error) {
+      byId('registration-error').textContent = error.message || 'Registration failed';
+      byId('registration-error').hidden = false;
+    } finally {
+      button.disabled = false;
+    }
+  });
   byId('workflow-rows').addEventListener('click', async (event) => {
     const startButton = event.target.closest('[data-start-workflow]');
     if (startButton) {
@@ -314,6 +402,7 @@
     event.preventDefault();
     const errorNode = byId('form-error');
     try {
+      if (!canStart) throw new Error('Your account does not have workflow start permission');
       const context = JSON.parse(byId('workflow-context').value || '{}');
       const name = byId('workflow-select').value;
       const response = await api(`/v1/workflows/${encodeURIComponent(name)}/instances`, {

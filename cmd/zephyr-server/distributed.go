@@ -39,6 +39,7 @@ type distributedConfig struct {
 	DevelopmentStaticAuth bool
 	OIDCIssuerURL         string
 	OIDCClientID          string
+	OIDCCLIClientID       string
 	OIDCClientSecret      string
 	OIDCAudience          string
 	OIDCRedirectURL       string
@@ -171,7 +172,8 @@ func serveDistributed(ctx context.Context, config distributedConfig) error {
 			return err
 		}
 		portalHandler, portalErr = portal.NewOIDC(api.Handler(), portal.OIDCOptions{
-			Client: oidcClient, CookieHashKey: hashKey, CookieBlockKey: blockKey, SecureCookies: true,
+			Client: oidcClient, CookieHashKey: hashKey, CookieBlockKey: blockKey, SecureCookies: true, Sessions: executions,
+			CLIIssuerURL: config.OIDCIssuerURL, CLIClientID: config.OIDCCLIClientID,
 		})
 	}
 	if portalErr != nil {
