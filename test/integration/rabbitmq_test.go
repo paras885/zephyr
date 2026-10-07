@@ -27,7 +27,14 @@ func TestRabbitMQQueueEndToEnd(t *testing.T) {
 		ContainerRequest: testcontainers.ContainerRequest{
 			Image:        "rabbitmq:3.13-management-alpine",
 			ExposedPorts: []string{"5672/tcp"},
-			WaitingFor:   wait.ForListeningPort("5672/tcp"),
+			// ForListeningPort alone is insufficient: RabbitMQ opens the AMQP
+			// TCP listener slightly before the broker finishes initializing,
+			// so early connections can be accepted and then reset. Wait for
+			// the broker's own readiness log line too.
+			WaitingFor: wait.ForAll(
+				wait.ForListeningPort("5672/tcp"),
+				wait.ForLog("Server startup complete"),
+			),
 		},
 		Started: true,
 	})
@@ -42,7 +49,11 @@ func TestRabbitMQQueueEndToEnd(t *testing.T) {
 		}
 	})
 
-	endpoint, err := container.Endpoint(ctx, "amqp")
+	// Use PortEndpoint with the explicit AMQP port rather than Endpoint, which
+	// picks the lowest-numbered port across *all* ports the rabbitmq image
+	// declares via EXPOSE (e.g. 4369/tcp for EPMD) even when that port was
+	// never published, causing a "port not found" error.
+	endpoint, err := container.PortEndpoint(ctx, "5672/tcp", "amqp")
 	if err != nil {
 		t.Fatalf("get RabbitMQ endpoint: %v", err)
 	}

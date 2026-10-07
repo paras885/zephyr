@@ -1,0 +1,15 @@
+apiVersion: v2
+name: zephyr
+description: Zephyr workflow engine control plane (server, migration job, and supporting Kubernetes resources)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/zephyr-workflow/zephyr
+sources:
+  - https://github.com/zephyr-workflow/zephyr
+keywords:
+  - workflow
+  - orchestration
+  - saga
+maintainers:
+  - name: Zephyr Workflow Contributors

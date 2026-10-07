@@ -403,9 +403,14 @@ func startRabbitLifecycleContainer(t *testing.T) (testcontainers.Container, stri
 			Image:        "rabbitmq:3.13-management-alpine",
 			Env:          map[string]string{"RABBITMQ_DEFAULT_USER": rabbitTestUser, "RABBITMQ_DEFAULT_PASS": rabbitTestPassword},
 			ExposedPorts: []string{"5672/tcp", "15672/tcp"},
+			// ForListeningPort alone is insufficient: RabbitMQ opens the AMQP
+			// TCP listener slightly before the broker finishes initializing,
+			// so early connections can be accepted and then reset. Wait for
+			// the broker's own readiness log line too.
 			WaitingFor: wait.ForAll(
 				wait.ForListeningPort("5672/tcp"),
 				wait.ForListeningPort("15672/tcp"),
+				wait.ForLog("Server startup complete"),
 			),
 			HostConfigModifier: func(hostConfig *dockercontainer.HostConfig) {
 				hostConfig.PortBindings = nat.PortMap{
@@ -426,7 +431,11 @@ func startRabbitLifecycleContainer(t *testing.T) (testcontainers.Container, stri
 			t.Errorf("terminate RabbitMQ lifecycle Testcontainer: %v", err)
 		}
 	})
-	amqpURL, err := container.Endpoint(ctx, "amqp")
+	// Use PortEndpoint with the explicit AMQP port rather than Endpoint, which
+	// picks the lowest-numbered port across *all* ports the rabbitmq image
+	// declares via EXPOSE (e.g. 4369/tcp for EPMD) even when that port was
+	// never published, causing a "port not found" error.
+	amqpURL, err := container.PortEndpoint(ctx, "5672/tcp", "amqp")
 	if err != nil {
 		t.Fatalf("get RabbitMQ AMQP endpoint: %v", err)
 	}

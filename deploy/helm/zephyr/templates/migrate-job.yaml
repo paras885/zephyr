@@ -1,0 +1,51 @@
+{{- if .Values.migrationJob.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  # Helm cannot upgrade an immutable Job in place. Re-run `helm uninstall
+  # --keep-history` of just this Job, or delete it, before each upgrade that
+  # changes the image, exactly as the plain-manifest docs describe:
+  #   kubectl delete job {{ include "zephyr.fullname" . }}-migrate --ignore-not-found
+  name: {{ include "zephyr.fullname" . }}-migrate
+  labels:
+    {{- include "zephyr.labels" . | nindent 4 }}
+  annotations:
+    # Forces a new Job object identity whenever the image changes, instead of
+    # silently keeping the previous completed Job's manifest on `helm upgrade`.
+    checksum/image: {{ include "zephyr.image" . | sha256sum }}
+spec:
+  backoffLimit: {{ .Values.migrationJob.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.migrationJob.activeDeadlineSeconds }}
+  ttlSecondsAfterFinished: {{ .Values.migrationJob.ttlSecondsAfterFinished }}
+  template:
+    metadata:
+      labels:
+        {{- include "zephyr.selectorLabels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          # Keep this identical to the server Deployment image.
+          image: {{ include "zephyr.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          args: ["-migrate-only"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secret.name }}
+                  key: DATABASE_URL
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+{{- end }}

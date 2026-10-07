@@ -165,6 +165,7 @@
   function renderWorkflows() {
     const filterButton = byId('clear-workflow-filter');
     filterButton.hidden = !state.selectedWorkflow;
+    syncFilterChip();
     byId('workflow-count').textContent = state.workflows.length;
     const rows = byId('workflow-rows');
     if (!state.workflows.length) {
@@ -349,6 +350,39 @@
       button.disabled = false;
     }
   });
+  function setActiveView(view) {
+    document.body.dataset.activeView = view;
+    document.querySelectorAll('[data-view]').forEach((item) => item.classList.toggle('active', item.dataset.view === view));
+    const workflows = view === 'workflows';
+    byId('page-title').textContent = workflows ? 'Workflow catalog' : 'Workflow operations';
+    byId('page-subtitle').textContent = workflows ? 'Registered definitions and their recent executions.' : 'A clear view of what is defined, running, and finished.';
+    byId('breadcrumb-current').textContent = workflows ? 'Workflows' : 'Overview';
+  }
+
+  function syncFilterChip() {
+    const chip = byId('run-filter-chip');
+    chip.hidden = !state.selectedWorkflow;
+    if (state.selectedWorkflow) byId('run-filter-name').textContent = state.selectedWorkflow;
+  }
+
+  async function clearWorkflowFilter() {
+    state.selectedWorkflow = '';
+    state.selectedRun = '';
+    state.offset = 0;
+    byId('clear-workflow-filter').hidden = true;
+    syncFilterChip();
+    byId('workflow-rows').querySelectorAll('tr[data-workflow]').forEach((row) => row.classList.remove('selected-workflow'));
+    try {
+      await loadRuns();
+      state.runSignature = JSON.stringify({ runs: state.runs, total: state.total, offset: state.offset });
+      renderRuns();
+      byId('detail-placeholder').hidden = false;
+      byId('run-detail').hidden = true;
+    } catch (error) {
+      showToast(error.message || 'Could not clear workflow filter', true);
+    }
+  }
+
   byId('workflow-rows').addEventListener('click', async (event) => {
     const startButton = event.target.closest('[data-start-workflow]');
     if (startButton) {
@@ -363,6 +397,7 @@
     state.selectedRun = '';
     state.offset = 0;
     byId('clear-workflow-filter').hidden = !state.selectedWorkflow;
+    syncFilterChip();
     byId('workflow-rows').querySelectorAll('tr[data-workflow]').forEach((row) => {
       row.classList.toggle('selected-workflow', row.dataset.workflow === state.selectedWorkflow);
     });
@@ -374,7 +409,10 @@
     } catch (error) {
       showToast(error.message || 'Could not filter workflow runs', true);
     }
-    if (state.selectedWorkflow) await loadWorkflowDefinition(state.selectedWorkflow);
+    if (state.selectedWorkflow) {
+      await loadWorkflowDefinition(state.selectedWorkflow);
+      setActiveView('overview');
+    }
   });
   byId('workflow-rows').addEventListener('keydown', (event) => {
     const workflowRow = event.target.closest('tr[data-workflow]');
@@ -423,35 +461,14 @@
   byId('run-search').addEventListener('input', renderRuns);
   byId('previous-page').addEventListener('click', () => { state.offset = Math.max(0, state.offset - pageSize); refresh(); });
   byId('next-page').addEventListener('click', () => { state.offset += pageSize; refresh(); });
-  byId('clear-workflow-filter').addEventListener('click', async () => {
-    state.selectedWorkflow = '';
-    state.selectedRun = '';
-    state.offset = 0;
-    byId('clear-workflow-filter').hidden = true;
-    byId('workflow-rows').querySelectorAll('tr[data-workflow]').forEach((row) => row.classList.remove('selected-workflow'));
-    try {
-      await loadRuns();
-      state.runSignature = JSON.stringify({ runs: state.runs, total: state.total, offset: state.offset });
-      renderRuns();
-      byId('detail-placeholder').hidden = false;
-      byId('run-detail').hidden = true;
-    } catch (error) {
-      showToast(error.message || 'Could not clear workflow filter', true);
-    }
-  });
+  byId('clear-workflow-filter').addEventListener('click', clearWorkflowFilter);
+  byId('clear-run-filter').addEventListener('click', clearWorkflowFilter);
   tokenInput.addEventListener('change', () => { sessionStorage.setItem('zephyr-token', tokenInput.value.trim()); refresh(); });
   signOutButton.addEventListener('click', async () => {
     const response = await fetch('/auth/logout', { method: 'POST', credentials: 'same-origin' });
     if (response.ok) window.location.assign('/auth/login');
   });
-  document.querySelectorAll('[data-view]').forEach((button) => button.addEventListener('click', () => {
-    document.querySelectorAll('[data-view]').forEach((item) => item.classList.toggle('active', item === button));
-    const workflows = button.dataset.view === 'workflows';
-    byId('page-title').textContent = workflows ? 'Workflow catalog' : 'Workflow operations';
-    byId('page-subtitle').textContent = workflows ? 'Registered definitions and their recent executions.' : 'A clear view of what is defined, running, and finished.';
-    byId('breadcrumb-current').textContent = workflows ? 'Workflows' : 'Overview';
-    document.getElementById(workflows ? 'workflow-section' : 'runs-section').scrollIntoView({ behavior: 'smooth', block: 'start' });
-  }));
+  document.querySelectorAll('[data-view]').forEach((button) => button.addEventListener('click', () => setActiveView(button.dataset.view)));
 
   configureAuthentication().then((ready) => {
     if (!ready) return;

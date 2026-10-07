@@ -48,6 +48,10 @@ jobs:
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
       - name: Render production Kubernetes manifests
         run: kubectl kustomize deploy/kubernetes > /tmp/zephyr-kubernetes.yaml
+      - name: Lint and render Helm chart
+        run: |
+          helm lint deploy/helm/zephyr --set image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000
+          helm template zephyr deploy/helm/zephyr --set image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000 > /tmp/zephyr-helm.yaml
 
   browser:
     name: Playwright portal tests

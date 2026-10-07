@@ -46,7 +46,15 @@ func TestTwoGatewayInstancesSharePostgresLeasesAndRabbitMQWork(t *testing.T) {
 		ContainerRequest: testcontainers.ContainerRequest{
 			Image: "postgres:16-alpine", Env: map[string]string{
 				"POSTGRES_USER": "zephyr", "POSTGRES_PASSWORD": "zephyr-test", "POSTGRES_DB": "zephyr",
-			}, ExposedPorts: []string{"5432/tcp"}, WaitingFor: wait.ForListeningPort("5432/tcp"),
+			}, ExposedPorts: []string{"5432/tcp"},
+			// ForListeningPort alone is insufficient: Postgres opens its TCP
+			// listener for a temporary initdb server before restarting into
+			// the real server, so "ready to accept connections" is logged
+			// twice before it's actually ready for use.
+			WaitingFor: wait.ForAll(
+				wait.ForListeningPort("5432/tcp"),
+				wait.ForLog("database system is ready to accept connections").WithOccurrence(2),
+			),
 		}, Started: true,
 	})
 	if err != nil {
@@ -90,7 +98,14 @@ func TestTwoGatewayInstancesSharePostgresLeasesAndRabbitMQWork(t *testing.T) {
 	rabbitContainer, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: testcontainers.ContainerRequest{
 			Image: "rabbitmq:3.13-management-alpine", ExposedPorts: []string{"5672/tcp"},
-			WaitingFor: wait.ForListeningPort("5672/tcp"),
+			// ForListeningPort alone is insufficient: RabbitMQ opens the AMQP
+			// TCP listener slightly before the broker finishes initializing,
+			// so early connections can be accepted and then reset. Wait for
+			// the broker's own readiness log line too.
+			WaitingFor: wait.ForAll(
+				wait.ForListeningPort("5672/tcp"),
+				wait.ForLog("Server startup complete"),
+			),
 		}, Started: true,
 	})
 	if err != nil {
@@ -103,7 +118,11 @@ func TestTwoGatewayInstancesSharePostgresLeasesAndRabbitMQWork(t *testing.T) {
 			t.Errorf("terminate RabbitMQ Testcontainer: %v", err)
 		}
 	})
-	amqpURL, err := rabbitContainer.Endpoint(ctx, "amqp")
+	// Use PortEndpoint with the explicit AMQP port rather than Endpoint, which
+	// picks the lowest-numbered port across *all* ports the rabbitmq image
+	// declares via EXPOSE (e.g. 4369/tcp for EPMD) even when that port was
+	// never published, causing a "port not found" error.
+	amqpURL, err := rabbitContainer.PortEndpoint(ctx, "5672/tcp", "amqp")
 	if err != nil {
 		t.Fatal(err)
 	}

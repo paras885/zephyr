@@ -91,6 +91,11 @@ h1 { color: #17251e; font: 700 25px var(--display); letter-spacing: 0; }
 .metric-completed .metric-value { color: #447d53; }
 .metric-failed .metric-value { color: #b85848; }
 .tiny-live-dot { width: 5px; height: 5px; }
+body[data-active-view="workflows"] #runs-section,
+body[data-active-view="workflows"] .metrics { display: none; }
+.filter-chip { display: inline-flex; align-items: center; gap: 6px; padding: 5px 5px 5px 9px; border: 1px solid #cfe3d3; border-radius: 20px; color: #2f6a47; background: #e8f4ed; font: 500 10px var(--mono); }
+.filter-chip button { width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center; border: 0; border-radius: 50%; color: #2f6a47; background: #d3e9da; font-size: 10px; line-height: 1; }
+.filter-chip button:hover { background: #bfdcc9; }
 .content-grid { display: grid; grid-template-columns: minmax(0, 1.65fr) minmax(290px, .9fr); gap: 14px; align-items: stretch; }
 .content-column { min-width: 0; display: grid; gap: 14px; align-content: start; }
 .panel { min-width: 0; border: 1px solid #e1e8e2; border-radius: 7px; background: var(--paper); box-shadow: 0 2px 7px #17231e05; }

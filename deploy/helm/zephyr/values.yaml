@@ -1,0 +1,107 @@
+# Default values for the zephyr chart.
+# This chart assumes externally managed PostgreSQL and RabbitMQ; it does not
+# install or operate those dependencies. See deploy/helm/zephyr/README.md.
+
+replicaCount: 2
+
+image:
+  repository: registry.example.com/zephyr
+  # Exact immutable digest, e.g. "sha256:...". Strongly preferred over tag so
+  # every replica and the migration Job run identical, reproducible code and
+  # workflow bundle.
+  digest: ""
+  # Only used when digest is empty. Avoid floating tags in production.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: false
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+
+service:
+  type: ClusterIP
+  port: 8080
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+# Non-secret environment variables merged into the Deployment and migration Job.
+env:
+  ZEPHYR_ENV: production
+  ZEPHYR_HTTP_ADDR: "0.0.0.0:8080"
+  ZEPHYR_WORKFLOWS_DIR: /app/workflows
+
+# Secret providing DATABASE_URL, AMQP_URL, and OIDC_* values consumed as
+# environment variables. By default the chart only references an
+# existing Secret; it does not create one so credentials never live in
+# values.yaml/Helm release history. Create it yourself, e.g.:
+#   kubectl create secret generic zephyr-runtime \
+#     --from-literal=DATABASE_URL=... --from-literal=AMQP_URL=... \
+#     --from-literal=OIDC_ISSUER_URL=... --from-literal=OIDC_CLIENT_ID=... \
+#     --from-literal=OIDC_API_AUDIENCE=... --from-literal=OIDC_REDIRECT_URL=... \
+#     --from-literal=OIDC_COOKIE_HASH_KEY="$(openssl rand -base64 32)" \
+#     --from-literal=OIDC_COOKIE_BLOCK_KEY="$(openssl rand -base64 32)"
+# Set secret.create: true only for local/throwaway clusters.
+secret:
+  create: false
+  name: zephyr-runtime
+  data: {}
+
+migrationJob:
+  enabled: true
+  backoffLimit: 3
+  activeDeadlineSeconds: 300
+  ttlSecondsAfterFinished: 86400
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+topologySpreadConstraints:
+  enabled: true
+  maxSkew: 1
+
+ingress:
+  enabled: false
+  className: nginx
+  host: zephyr.example.com
+  tls:
+    enabled: true
+    secretName: zephyr-tls
+  annotations: {}
+
+networkPolicy:
+  # Disabled by default: apply only after confirming the cluster CNI enforces
+  # NetworkPolicy, and after setting namespaceSelector to your ingress and
+  # metrics-scraper namespace label.
+  enabled: false
+  namespaceSelector:
+    kubernetes.io/metadata.name: ingress-nginx
+
+probes:
+  startup:
+    periodSeconds: 2
+    failureThreshold: 30
+  liveness:
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+
+terminationGracePeriodSeconds: 30

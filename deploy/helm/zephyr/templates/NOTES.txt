@@ -1,0 +1,23 @@
+Zephyr server release "{{ .Release.Name }}" has been queued in namespace {{ .Release.Namespace }}.
+
+1. Confirm the migration Job completed before traffic relies on the Deployment:
+   kubectl wait --for=condition=complete --timeout=5m job/{{ include "zephyr.fullname" . }}-migrate -n {{ .Release.Namespace }}
+
+2. Check rollout status:
+   kubectl rollout status deployment/{{ include "zephyr.fullname" . }} -n {{ .Release.Namespace }}
+
+3. Reach the portal/API:
+{{- if .Values.ingress.enabled }}
+   https://{{ .Values.ingress.host }}
+{{- else }}
+   kubectl port-forward service/{{ include "zephyr.fullname" . }} 8080:{{ .Values.service.port }} -n {{ .Release.Namespace }}
+   open http://127.0.0.1:8080
+{{- end }}
+
+Reminders:
+- This chart does not install PostgreSQL or RabbitMQ; provision, secure, back
+  up, and monitor them separately, and reference them through the
+  "{{ .Values.secret.name }}" Secret (see values.yaml comments).
+- image.digest must be an exact, immutable digest so every replica and the
+  migration Job run the same binary and workflow bundle.
+- Review deploy/helm/zephyr/README.md for upgrade and NetworkPolicy guidance.

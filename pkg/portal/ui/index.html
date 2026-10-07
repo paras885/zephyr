@@ -8,7 +8,7 @@
   <link rel="stylesheet" href="/portal.css">
   <script src="/portal.js" defer></script>
 </head>
-<body>
+<body data-active-view="overview">
   <div class="app-shell">
     <aside class="sidebar">
       <a class="brand" href="/" aria-label="Zephyr home">
@@ -74,6 +74,7 @@
             <div class="panel-heading runs-heading">
               <div><div class="section-kicker">EXECUTIONS</div><h2>Recent runs <span class="heading-count" id="run-count">0</span></h2></div>
               <div class="run-controls">
+                <span class="filter-chip" id="run-filter-chip" hidden>Filtered by <strong id="run-filter-name"></strong><button id="clear-run-filter" type="button" aria-label="Clear workflow filter">✕</button></span>
                 <label class="search-box"><span aria-hidden="true">⌕</span><input id="run-search" type="search" placeholder="Find a run" aria-label="Search runs"></label>
                 <select id="status-filter" aria-label="Filter runs by status"><option value="">All statuses</option><option value="RUNNING">In progress</option><option value="COMPLETED">Completed</option><option value="FAILED">Failed</option><option value="COMPENSATING">Compensating</option></select>
               </div>
