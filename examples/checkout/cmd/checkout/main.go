@@ -35,67 +35,94 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	var workerToken token.Source
-	if tokenURL := os.Getenv("OAUTH_TOKEN_URL"); tokenURL != "" {
-		if config.Token != "" {
-			return fmt.Errorf("configure OAuth service identities or ZEPHYR_TOKEN, not both")
-		}
-		config.TokenSource, err = token.NewClientCredentialsSource(token.ClientCredentialsConfig{
-			TokenURL: tokenURL, ClientID: os.Getenv("OAUTH_APP_CLIENT_ID"), ClientSecret: os.Getenv("OAUTH_APP_CLIENT_SECRET"),
-		})
-		if err != nil {
-			return err
-		}
-		workerToken, err = token.NewClientCredentialsSource(token.ClientCredentialsConfig{
-			TokenURL: tokenURL, ClientID: os.Getenv("OAUTH_WORKER_CLIENT_ID"), ClientSecret: os.Getenv("OAUTH_WORKER_CLIENT_SECRET"),
-		})
-		if err != nil {
-			return err
-		}
-	} else {
-		if config.Token == "" {
-			return fmt.Errorf("configure OAUTH_TOKEN_URL and service identities, or development ZEPHYR_TOKEN")
-		}
-		workerToken = token.SourceFunc(func(context.Context) (string, error) { return config.Token, nil })
-	}
-	client, err := generated.NewCheckoutClient(config)
+	workerToken, err := configureTokenSource(&config)
 	if err != nil {
 		return err
 	}
-	runs, err := zephyrclient.New(config)
-	if err != nil {
-		return err
-	}
-	control, err := worker.NewHTTPTransportWithTokenSource(config.Endpoint, &http.Client{}, workerToken)
-	if err != nil {
-		return err
-	}
-	broker, err := queue.NewRabbitMQManager(ctx, os.Getenv("AMQP_URL"))
+	client, runs, consumer, broker, err := buildComponents(ctx, config, workerToken)
 	if err != nil {
 		return err
 	}
 	defer broker.Close()
-	completions, err := queue.NewManagedRabbitMQCompletionQueue(broker, "zephyr-completions")
-	if err != nil {
-		return err
-	}
-	transport, err := worker.NewRabbitMQTransport(control, completions)
-	if err != nil {
-		return err
-	}
-	consumer, err := worker.NewClient(transport, "checkout-application", 30*time.Second)
-	if err != nil {
-		return err
-	}
 	address := os.Getenv("APP_ADDR")
 	if address == "" {
 		address = "127.0.0.1:8090"
 	}
 	server := &http.Server{Addr: address, Handler: newHandler(client, runs), ReadHeaderTimeout: 5 * time.Second}
+	return serve(ctx, stop, server, consumer, address, config.Endpoint)
+}
+
+// configureTokenSource selects between OAuth client-credentials and a static
+// development token based on environment configuration, mutating config.TokenSource
+// for platform calls and returning the token source workers should use.
+func configureTokenSource(config *zephyrclient.Config) (token.Source, error) {
+	tokenURL := os.Getenv("OAUTH_TOKEN_URL")
+	if tokenURL == "" {
+		if config.Token == "" {
+			return nil, fmt.Errorf("configure OAUTH_TOKEN_URL and service identities, or development ZEPHYR_TOKEN")
+		}
+		return token.SourceFunc(func(context.Context) (string, error) { return config.Token, nil }), nil
+	}
+	if config.Token != "" {
+		return nil, fmt.Errorf("configure OAuth service identities or ZEPHYR_TOKEN, not both")
+	}
+	var err error
+	config.TokenSource, err = token.NewClientCredentialsSource(token.ClientCredentialsConfig{
+		TokenURL: tokenURL, ClientID: os.Getenv("OAUTH_APP_CLIENT_ID"), ClientSecret: os.Getenv("OAUTH_APP_CLIENT_SECRET"),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return token.NewClientCredentialsSource(token.ClientCredentialsConfig{
+		TokenURL: tokenURL, ClientID: os.Getenv("OAUTH_WORKER_CLIENT_ID"), ClientSecret: os.Getenv("OAUTH_WORKER_CLIENT_SECRET"),
+	})
+}
+
+// buildComponents wires the checkout client, platform client, and worker consumer
+// used by run. The returned broker must be closed by the caller.
+func buildComponents(ctx context.Context, config zephyrclient.Config, workerToken token.Source) (*generated.CheckoutClient, *zephyrclient.Client, *worker.Client, *queue.RabbitMQManager, error) {
+	client, err := generated.NewCheckoutClient(config)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	runs, err := zephyrclient.New(config)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	control, err := worker.NewHTTPTransportWithTokenSource(config.Endpoint, &http.Client{}, workerToken)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	broker, err := queue.NewRabbitMQManager(ctx, os.Getenv("AMQP_URL"))
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	completions, err := queue.NewManagedRabbitMQCompletionQueue(broker, "zephyr-completions")
+	if err != nil {
+		broker.Close()
+		return nil, nil, nil, nil, err
+	}
+	transport, err := worker.NewRabbitMQTransport(control, completions)
+	if err != nil {
+		broker.Close()
+		return nil, nil, nil, nil, err
+	}
+	consumer, err := worker.NewClient(transport, "checkout-application", 30*time.Second)
+	if err != nil {
+		broker.Close()
+		return nil, nil, nil, nil, err
+	}
+	return client, runs, consumer, broker, nil
+}
+
+// serve runs the task consumer and HTTP server until the context is cancelled or
+// either fails, then gracefully shuts the server down.
+func serve(ctx context.Context, stop context.CancelFunc, server *http.Server, consumer *worker.Client, address, platformEndpoint string) error {
 	failures := make(chan error, 2)
 	go func() { failures <- consume(ctx, consumer, checkoutTasks{}) }()
 	go func() { failures <- server.ListenAndServe() }()
-	slog.Info("checkout application started", "address", address, "platform", config.Endpoint, "tasks", "simulated payment and receipt")
+	slog.Info("checkout application started", "address", address, "platform", platformEndpoint, "tasks", "simulated payment and receipt")
+	var err error
 	select {
 	case <-ctx.Done():
 	case err = <-failures:

@@ -43,23 +43,51 @@ type Runtime struct {
 }
 
 func New(ctx context.Context, serviceName string, sampleRatio float64) (*Runtime, error) {
-	if ctx == nil {
-		return nil, fmt.Errorf("telemetry context is required")
-	}
-	if strings.TrimSpace(serviceName) == "" {
-		return nil, fmt.Errorf("telemetry service name is required")
-	}
-	if sampleRatio < 0 || sampleRatio > 1 {
-		return nil, fmt.Errorf("trace sampling ratio must be between 0 and 1")
+	if err := validateNewArgs(ctx, serviceName, sampleRatio); err != nil {
+		return nil, err
 	}
 	registry := prometheus.NewRegistry()
+	if err := registerGoProcessCollectors(registry); err != nil {
+		return nil, err
+	}
+	runtime := newRuntimeMetrics(serviceName, registry)
+	if err := registerRuntimeCollectors(registry, runtime); err != nil {
+		return nil, err
+	}
+	if err := configureTracing(ctx, serviceName, sampleRatio, runtime); err != nil {
+		return nil, err
+	}
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo, ReplaceAttr: replaceLogAttribute,
+	})))
+	return runtime, nil
+}
+
+func validateNewArgs(ctx context.Context, serviceName string, sampleRatio float64) error {
+	if ctx == nil {
+		return fmt.Errorf("telemetry context is required")
+	}
+	if strings.TrimSpace(serviceName) == "" {
+		return fmt.Errorf("telemetry service name is required")
+	}
+	if sampleRatio < 0 || sampleRatio > 1 {
+		return fmt.Errorf("trace sampling ratio must be between 0 and 1")
+	}
+	return nil
+}
+
+func registerGoProcessCollectors(registry *prometheus.Registry) error {
 	if err := registry.Register(collectors.NewGoCollector()); err != nil {
-		return nil, fmt.Errorf("register Go runtime metrics: %w", err)
+		return fmt.Errorf("register Go runtime metrics: %w", err)
 	}
 	if err := registry.Register(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{})); err != nil {
-		return nil, fmt.Errorf("register process metrics: %w", err)
+		return fmt.Errorf("register process metrics: %w", err)
 	}
-	runtime := &Runtime{
+	return nil
+}
+
+func newRuntimeMetrics(serviceName string, registry *prometheus.Registry) *Runtime {
+	return &Runtime{
 		serviceName: serviceName,
 		registry:    registry,
 		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -97,36 +125,41 @@ func New(ctx context.Context, serviceName string, sampleRatio float64) (*Runtime
 			Name: "zephyr_expired_lease_backlog", Help: "Expired active leases awaiting recovery.",
 		}),
 	}
+}
+
+func registerRuntimeCollectors(registry *prometheus.Registry, runtime *Runtime) error {
 	for _, collector := range []prometheus.Collector{
 		runtime.requests, runtime.requestDuration, runtime.dependencyReadiness, runtime.stateCounts, runtime.queueDepth,
 		runtime.operationDuration, runtime.operationEvents,
 		runtime.outboxBacklog, runtime.outboxOldestAge, runtime.outboxRetryAttempts, runtime.leaseBacklog,
 	} {
 		if err := registry.Register(collector); err != nil {
-			return nil, fmt.Errorf("register Zephyr metrics: %w", err)
+			return fmt.Errorf("register Zephyr metrics: %w", err)
 		}
 	}
+	return nil
+}
+
+func configureTracing(ctx context.Context, serviceName string, sampleRatio float64, runtime *Runtime) error {
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
-	if endpoint := strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")); endpoint != "" || strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")) != "" {
-		exporter, err := otlptracehttp.New(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("create OTLP trace exporter: %w", err)
-		}
-		res, err := resource.New(ctx, resource.WithAttributes(attribute.String("service.name", serviceName)))
-		if err != nil {
-			return nil, fmt.Errorf("create telemetry resource: %w", err)
-		}
-		runtime.tracerProvider = sdktrace.NewTracerProvider(
-			sdktrace.WithBatcher(exporter),
-			sdktrace.WithResource(res),
-			sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(sampleRatio))),
-		)
-		otel.SetTracerProvider(runtime.tracerProvider)
+	if endpoint := strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")); endpoint == "" && strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")) == "" {
+		return nil
 	}
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo, ReplaceAttr: replaceLogAttribute,
-	})))
-	return runtime, nil
+	exporter, err := otlptracehttp.New(ctx)
+	if err != nil {
+		return fmt.Errorf("create OTLP trace exporter: %w", err)
+	}
+	res, err := resource.New(ctx, resource.WithAttributes(attribute.String("service.name", serviceName)))
+	if err != nil {
+		return fmt.Errorf("create telemetry resource: %w", err)
+	}
+	runtime.tracerProvider = sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(res),
+		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(sampleRatio))),
+	)
+	otel.SetTracerProvider(runtime.tracerProvider)
+	return nil
 }
 
 func (runtime *Runtime) MetricsHandler() http.Handler {

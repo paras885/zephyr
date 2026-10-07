@@ -90,49 +90,66 @@ func (webhook *Webhook) Publish(ctx context.Context, event domain.Event) error {
 	}
 	var lastErr error
 	for attempt := 0; attempt < webhook.maxAttempts; attempt++ {
-		request, err := http.NewRequestWithContext(ctx, http.MethodPost, webhook.endpoint, bytes.NewReader(body))
-		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, "create webhook request failed")
-			return fmt.Errorf("create event webhook request: %w", err)
+		done, err := webhook.deliverAttempt(ctx, span, body, event)
+		if done {
+			return err
 		}
-		request.Header.Set("Content-Type", "application/json")
-		request.Header.Set("Idempotency-Key", event.WorkflowID+":"+strconv.FormatUint(event.Sequence, 10))
-		if webhook.token != "" {
-			request.Header.Set("Authorization", "Bearer "+webhook.token)
-		}
-		response, requestErr := webhook.client.Do(request)
-		if requestErr == nil {
-			message, readErr := io.ReadAll(io.LimitReader(response.Body, 64*1024))
-			_ = response.Body.Close()
-			if readErr != nil {
-				lastErr = fmt.Errorf("read event webhook response: %w", readErr)
-			} else if response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
-				return nil
-			} else {
-				lastErr = &WebhookError{StatusCode: response.StatusCode, Message: string(bytes.TrimSpace(message))}
-				if response.StatusCode >= http.StatusBadRequest && response.StatusCode < http.StatusInternalServerError && response.StatusCode != http.StatusTooManyRequests {
-					return lastErr
-				}
-			}
-		} else {
-			lastErr = requestErr
-		}
+		lastErr = err
 		span.AddEvent("webhook.attempt", trace.WithAttributes(attribute.Int("attempt", attempt+1)))
 		if attempt+1 == webhook.maxAttempts {
 			break
 		}
-		timer := time.NewTimer(webhook.retryDelay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
+		if err := webhook.waitBeforeRetry(ctx); err != nil {
+			return err
 		}
 	}
 	span.RecordError(lastErr)
 	span.SetStatus(codes.Error, "webhook delivery failed")
 	return fmt.Errorf("event webhook delivery failed after %d attempts: %w", webhook.maxAttempts, lastErr)
+}
+
+// deliverAttempt performs one delivery attempt. done is true when the retry loop should stop
+// immediately, returning err as the final Publish result (nil on success).
+func (webhook *Webhook) deliverAttempt(ctx context.Context, span trace.Span, body []byte, event domain.Event) (bool, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, webhook.endpoint, bytes.NewReader(body))
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "create webhook request failed")
+		return true, fmt.Errorf("create event webhook request: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", event.WorkflowID+":"+strconv.FormatUint(event.Sequence, 10))
+	if webhook.token != "" {
+		request.Header.Set("Authorization", "Bearer "+webhook.token)
+	}
+	response, requestErr := webhook.client.Do(request)
+	if requestErr != nil {
+		return false, requestErr
+	}
+	message, readErr := io.ReadAll(io.LimitReader(response.Body, 64*1024))
+	_ = response.Body.Close()
+	if readErr != nil {
+		return false, fmt.Errorf("read event webhook response: %w", readErr)
+	}
+	if response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
+		return true, nil
+	}
+	webhookErr := &WebhookError{StatusCode: response.StatusCode, Message: string(bytes.TrimSpace(message))}
+	if response.StatusCode >= http.StatusBadRequest && response.StatusCode < http.StatusInternalServerError && response.StatusCode != http.StatusTooManyRequests {
+		return true, webhookErr
+	}
+	return false, webhookErr
+}
+
+func (webhook *Webhook) waitBeforeRetry(ctx context.Context) error {
+	timer := time.NewTimer(webhook.retryDelay)
+	select {
+	case <-ctx.Done():
+		timer.Stop()
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 var _ Publisher = (*Webhook)(nil)

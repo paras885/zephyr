@@ -10,6 +10,7 @@ zephyr.db-wal
 
 # Editor / OS
 .DS_Store
+.vscode/
 node_modules/
 test-results/
 playwright-report/

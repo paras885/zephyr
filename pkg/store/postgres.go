@@ -104,88 +104,87 @@ func MigratePostgres(ctx context.Context, db *sql.DB) error {
 		return fmt.Errorf("begin PostgreSQL migration: %w", err)
 	}
 	defer transaction.Rollback()
-	if _, err := transaction.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
-		version BIGINT PRIMARY KEY,
-		applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	)`); err != nil {
-		return fmt.Errorf("create migration table: %w", err)
+	if err := ensurePostgresMigrationsTable(ctx, transaction); err != nil {
+		return err
 	}
-	var applied bool
-	if err := transaction.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = $1)`, postgresMigrationVersion).Scan(&applied); err != nil {
-		return fmt.Errorf("check PostgreSQL migration version: %w", err)
+	if err := migratePostgresInitial(ctx, transaction); err != nil {
+		return err
 	}
-	if !applied {
-		migration, err := postgresMigration.ReadFile("migrations/0001_initial.sql")
-		if err != nil {
-			return fmt.Errorf("read PostgreSQL migration: %w", err)
-		}
-		if _, err := transaction.ExecContext(ctx, string(migration)); err != nil {
-			return fmt.Errorf("apply PostgreSQL migration: %w", err)
-		}
-		if _, err := transaction.ExecContext(ctx, `INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING`, postgresMigrationVersion); err != nil {
-			return fmt.Errorf("record PostgreSQL migration: %w", err)
-		}
+	if err := applyPostgresVersionedMigration(ctx, transaction, 2, postgresOutboxMigration, "outbox"); err != nil {
+		return err
 	}
-	if err := transaction.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = 2)`).Scan(&applied); err != nil {
-		return fmt.Errorf("check PostgreSQL outbox migration version: %w", err)
+	if err := applyPostgresVersionedMigration(ctx, transaction, 3, postgresIdempotencyMigration, "idempotency"); err != nil {
+		return err
 	}
-	if !applied {
-		if _, err := transaction.ExecContext(ctx, string(postgresOutboxMigration)); err != nil {
-			return fmt.Errorf("apply PostgreSQL outbox migration: %w", err)
-		}
-		if _, err := transaction.ExecContext(ctx, `INSERT INTO schema_migrations (version) VALUES (2) ON CONFLICT DO NOTHING`); err != nil {
-			return fmt.Errorf("record PostgreSQL outbox migration: %w", err)
-		}
+	if err := applyPostgresVersionedMigration(ctx, transaction, 4, postgresTaskPublicationMigration, "task publication"); err != nil {
+		return err
 	}
-	if err := transaction.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = 3)`).Scan(&applied); err != nil {
-		return fmt.Errorf("check PostgreSQL idempotency migration version: %w", err)
+	if err := applyPostgresVersionedMigration(ctx, transaction, 5, postgresLeaseMigration, "lease"); err != nil {
+		return err
 	}
-	if !applied {
-		if _, err := transaction.ExecContext(ctx, string(postgresIdempotencyMigration)); err != nil {
-			return fmt.Errorf("apply PostgreSQL idempotency migration: %w", err)
-		}
-		if _, err := transaction.ExecContext(ctx, `INSERT INTO schema_migrations (version) VALUES (3) ON CONFLICT DO NOTHING`); err != nil {
-			return fmt.Errorf("record PostgreSQL idempotency migration: %w", err)
-		}
-	}
-	if err := transaction.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = 4)`).Scan(&applied); err != nil {
-		return fmt.Errorf("check PostgreSQL task publication migration version: %w", err)
-	}
-	if !applied {
-		if _, err := transaction.ExecContext(ctx, string(postgresTaskPublicationMigration)); err != nil {
-			return fmt.Errorf("apply PostgreSQL task publication migration: %w", err)
-		}
-		if _, err := transaction.ExecContext(ctx, `INSERT INTO schema_migrations (version) VALUES (4) ON CONFLICT DO NOTHING`); err != nil {
-			return fmt.Errorf("record PostgreSQL task publication migration: %w", err)
-		}
-	}
-	if err := transaction.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = 5)`).Scan(&applied); err != nil {
-		return fmt.Errorf("check PostgreSQL lease migration version: %w", err)
-	}
-	if !applied {
-		if _, err := transaction.ExecContext(ctx, string(postgresLeaseMigration)); err != nil {
-			return fmt.Errorf("apply PostgreSQL lease migration: %w", err)
-		}
-		if _, err := transaction.ExecContext(ctx, `INSERT INTO schema_migrations (version) VALUES (5) ON CONFLICT DO NOTHING`); err != nil {
-			return fmt.Errorf("record PostgreSQL lease migration: %w", err)
-		}
-	}
-	if err := transaction.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = 6)`).Scan(&applied); err != nil {
-		return fmt.Errorf("check PostgreSQL retention migration version: %w", err)
-	}
-	if !applied {
-		if _, err := transaction.ExecContext(ctx, string(postgresRetentionMigration)); err != nil {
-			return fmt.Errorf("apply PostgreSQL retention migration: %w", err)
-		}
-		if _, err := transaction.ExecContext(ctx, `INSERT INTO schema_migrations (version) VALUES (6) ON CONFLICT DO NOTHING`); err != nil {
-			return fmt.Errorf("record PostgreSQL retention migration: %w", err)
-		}
+	if err := applyPostgresVersionedMigration(ctx, transaction, 6, postgresRetentionMigration, "retention"); err != nil {
+		return err
 	}
 	if err := applyPortalRegistryMigration(ctx, transaction, postgresPortalRegistryMigration); err != nil {
 		return err
 	}
 	if err := transaction.Commit(); err != nil {
 		return fmt.Errorf("commit PostgreSQL migration: %w", err)
+	}
+	return nil
+}
+
+// ensurePostgresMigrationsTable creates the schema_migrations tracking table if it doesn't exist yet.
+func ensurePostgresMigrationsTable(ctx context.Context, transaction *sql.Tx) error {
+	if _, err := transaction.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
+		version BIGINT PRIMARY KEY,
+		applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`); err != nil {
+		return fmt.Errorf("create migration table: %w", err)
+	}
+	return nil
+}
+
+// migratePostgresInitial applies the version 1 (initial schema) migration, which is read from an
+// embedded file rather than an in-memory byte slice like the later versioned migrations.
+func migratePostgresInitial(ctx context.Context, transaction *sql.Tx) error {
+	var applied bool
+	if err := transaction.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = $1)`, postgresMigrationVersion).Scan(&applied); err != nil {
+		return fmt.Errorf("check PostgreSQL migration version: %w", err)
+	}
+	if applied {
+		return nil
+	}
+	migration, err := postgresMigration.ReadFile("migrations/0001_initial.sql")
+	if err != nil {
+		return fmt.Errorf("read PostgreSQL migration: %w", err)
+	}
+	if _, err := transaction.ExecContext(ctx, string(migration)); err != nil {
+		return fmt.Errorf("apply PostgreSQL migration: %w", err)
+	}
+	if _, err := transaction.ExecContext(ctx, `INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING`, postgresMigrationVersion); err != nil {
+		return fmt.Errorf("record PostgreSQL migration: %w", err)
+	}
+	return nil
+}
+
+// applyPostgresVersionedMigration applies a single numbered migration step if it hasn't been
+// recorded in schema_migrations yet, wrapping errors with the given human-readable label.
+func applyPostgresVersionedMigration(ctx context.Context, transaction *sql.Tx, version int, migration []byte, label string) error {
+	var applied bool
+	checkQuery := fmt.Sprintf(`SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = %d)`, version)
+	if err := transaction.QueryRowContext(ctx, checkQuery).Scan(&applied); err != nil {
+		return fmt.Errorf("check PostgreSQL %s migration version: %w", label, err)
+	}
+	if applied {
+		return nil
+	}
+	if _, err := transaction.ExecContext(ctx, string(migration)); err != nil {
+		return fmt.Errorf("apply PostgreSQL %s migration: %w", label, err)
+	}
+	insertQuery := fmt.Sprintf(`INSERT INTO schema_migrations (version) VALUES (%d) ON CONFLICT DO NOTHING`, version)
+	if _, err := transaction.ExecContext(ctx, insertQuery); err != nil {
+		return fmt.Errorf("record PostgreSQL %s migration: %w", label, err)
 	}
 	return nil
 }
@@ -251,6 +250,33 @@ func (store *PostgresStore) CreateIdempotent(ctx context.Context, instance *doma
 }
 
 func createPostgresExecution(ctx context.Context, transaction *sql.Tx, instance *domain.WorkflowInstance) error {
+	if err := validatePostgresNewExecution(instance); err != nil {
+		return err
+	}
+	definitionJSON, snapshotJSON, contextJSON, err := marshalPostgresExecutionPayload(instance)
+	if err != nil {
+		return err
+	}
+	if err := upsertPostgresWorkflowDefinition(ctx, transaction, instance, definitionJSON); err != nil {
+		return err
+	}
+	inserted, err := insertPostgresWorkflowExecution(ctx, transaction, instance, contextJSON, snapshotJSON)
+	if err != nil {
+		return err
+	}
+	if !inserted {
+		return ErrAlreadyExists
+	}
+	for _, event := range instance.Events {
+		if err := insertWorkflowEvent(ctx, transaction, event); err != nil {
+			return err
+		}
+	}
+	return syncTasks(ctx, transaction, instance)
+}
+
+// validatePostgresNewExecution checks the required preconditions for creating a new workflow execution.
+func validatePostgresNewExecution(instance *domain.WorkflowInstance) error {
 	if instance == nil {
 		return fmt.Errorf("workflow instance is required")
 	}
@@ -260,18 +286,30 @@ func createPostgresExecution(ctx context.Context, transaction *sql.Tx, instance 
 	if err := instance.Definition.Validate(); err != nil {
 		return fmt.Errorf("validate workflow definition: %w", err)
 	}
-	definitionJSON, err := json.Marshal(instance.Definition)
+	return nil
+}
+
+// marshalPostgresExecutionPayload encodes the definition, snapshot, and context JSON payloads
+// needed to persist a new workflow execution.
+func marshalPostgresExecutionPayload(instance *domain.WorkflowInstance) (definitionJSON, snapshotJSON, contextJSON []byte, err error) {
+	definitionJSON, err = json.Marshal(instance.Definition)
 	if err != nil {
-		return fmt.Errorf("encode workflow definition: %w", err)
+		return nil, nil, nil, fmt.Errorf("encode workflow definition: %w", err)
 	}
-	snapshotJSON, err := json.Marshal(instance)
+	snapshotJSON, err = json.Marshal(instance)
 	if err != nil {
-		return fmt.Errorf("encode workflow snapshot: %w", err)
+		return nil, nil, nil, fmt.Errorf("encode workflow snapshot: %w", err)
 	}
-	contextJSON, err := json.Marshal(instance.Context)
+	contextJSON, err = json.Marshal(instance.Context)
 	if err != nil {
-		return fmt.Errorf("encode workflow context: %w", err)
+		return nil, nil, nil, fmt.Errorf("encode workflow context: %w", err)
 	}
+	return definitionJSON, snapshotJSON, contextJSON, nil
+}
+
+// upsertPostgresWorkflowDefinition inserts the workflow definition if absent, then verifies that
+// the stored definition matches the one being created, returning ErrDefinitionConflict otherwise.
+func upsertPostgresWorkflowDefinition(ctx context.Context, transaction *sql.Tx, instance *domain.WorkflowInstance, definitionJSON []byte) error {
 	if _, err := transaction.ExecContext(ctx, `INSERT INTO workflow_definitions (workflow_name, version, definition)
 		VALUES ($1, $2, $3) ON CONFLICT (workflow_name, version) DO NOTHING`, instance.Definition.Name, instance.Definition.Version, definitionJSON); err != nil {
 		return fmt.Errorf("insert workflow definition: %w", err)
@@ -287,29 +325,24 @@ func createPostgresExecution(ctx context.Context, transaction *sql.Tx, instance 
 	if !reflect.DeepEqual(storedDefinition, instance.Definition) {
 		return ErrDefinitionConflict
 	}
+	return nil
+}
+
+// insertPostgresWorkflowExecution inserts the workflow execution row, reporting whether a new row
+// was actually inserted (false means a row with the same ID already existed).
+func insertPostgresWorkflowExecution(ctx context.Context, transaction *sql.Tx, instance *domain.WorkflowInstance, contextJSON, snapshotJSON []byte) (bool, error) {
 	result, err := transaction.ExecContext(ctx, `INSERT INTO workflow_executions
 		(id, workflow_name, definition_version, status, context, snapshot)
 		VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING`,
 		instance.ID, instance.Definition.Name, instance.Definition.Version, instance.Status, contextJSON, snapshotJSON)
 	if err != nil {
-		return fmt.Errorf("insert workflow execution: %w", err)
+		return false, fmt.Errorf("insert workflow execution: %w", err)
 	}
 	inserted, err := result.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("check workflow insertion: %w", err)
+		return false, fmt.Errorf("check workflow insertion: %w", err)
 	}
-	if inserted == 0 {
-		return ErrAlreadyExists
-	}
-	for _, event := range instance.Events {
-		if err := insertWorkflowEvent(ctx, transaction, event); err != nil {
-			return err
-		}
-	}
-	if err := syncTasks(ctx, transaction, instance); err != nil {
-		return err
-	}
-	return nil
+	return inserted != 0, nil
 }
 
 func (store *PostgresStore) Get(workflowID string) (*domain.WorkflowInstance, error) {
@@ -451,18 +484,9 @@ func appendPostgresEvents(ctx context.Context, transaction *sql.Tx, workflowID s
 	if workflowID == "" || len(events) == 0 {
 		return fmt.Errorf("workflow ID and at least one workflow event are required")
 	}
-	var snapshot []byte
-	var version int64
-	var err error
-	if err = transaction.QueryRowContext(ctx, `SELECT snapshot, version FROM workflow_executions WHERE id = $1`, workflowID).Scan(&snapshot, &version); err != nil {
-		if err == sql.ErrNoRows {
-			return fmt.Errorf("%w: %s", ErrNotFound, workflowID)
-		}
-		return fmt.Errorf("read workflow snapshot for append: %w", err)
-	}
-	var instance domain.WorkflowInstance
-	if err := json.Unmarshal(snapshot, &instance); err != nil {
-		return fmt.Errorf("decode workflow snapshot for append: %w", err)
+	instance, version, err := loadPostgresExecutionForAppend(ctx, transaction, workflowID)
+	if err != nil {
+		return err
 	}
 	firstNewEvent := len(instance.Events)
 	for _, event := range events {
@@ -470,7 +494,39 @@ func appendPostgresEvents(ctx context.Context, transaction *sql.Tx, workflowID s
 			return err
 		}
 	}
-	snapshot, err = json.Marshal(&instance)
+	if err := savePostgresExecutionSnapshot(ctx, transaction, workflowID, version, &instance); err != nil {
+		return err
+	}
+	for _, event := range instance.Events[firstNewEvent:] {
+		if err := insertWorkflowEvent(ctx, transaction, event); err != nil {
+			return err
+		}
+	}
+	return syncTasks(ctx, transaction, &instance)
+}
+
+// loadPostgresExecutionForAppend reads and decodes the current snapshot and version of a workflow
+// execution so new events can be appended to it.
+func loadPostgresExecutionForAppend(ctx context.Context, transaction *sql.Tx, workflowID string) (domain.WorkflowInstance, int64, error) {
+	var snapshot []byte
+	var version int64
+	if err := transaction.QueryRowContext(ctx, `SELECT snapshot, version FROM workflow_executions WHERE id = $1`, workflowID).Scan(&snapshot, &version); err != nil {
+		if err == sql.ErrNoRows {
+			return domain.WorkflowInstance{}, 0, fmt.Errorf("%w: %s", ErrNotFound, workflowID)
+		}
+		return domain.WorkflowInstance{}, 0, fmt.Errorf("read workflow snapshot for append: %w", err)
+	}
+	var instance domain.WorkflowInstance
+	if err := json.Unmarshal(snapshot, &instance); err != nil {
+		return domain.WorkflowInstance{}, 0, fmt.Errorf("decode workflow snapshot for append: %w", err)
+	}
+	return instance, version, nil
+}
+
+// savePostgresExecutionSnapshot persists the updated snapshot with an optimistic version check,
+// returning ErrConflict if the version has moved on since it was loaded.
+func savePostgresExecutionSnapshot(ctx context.Context, transaction *sql.Tx, workflowID string, version int64, instance *domain.WorkflowInstance) error {
+	snapshot, err := json.Marshal(instance)
 	if err != nil {
 		return fmt.Errorf("encode workflow snapshot: %w", err)
 	}
@@ -490,14 +546,6 @@ func appendPostgresEvents(ctx context.Context, transaction *sql.Tx, workflowID s
 	}
 	if updated == 0 {
 		return ErrConflict
-	}
-	for _, event := range instance.Events[firstNewEvent:] {
-		if err := insertWorkflowEvent(ctx, transaction, event); err != nil {
-			return err
-		}
-	}
-	if err := syncTasks(ctx, transaction, &instance); err != nil {
-		return err
 	}
 	return nil
 }

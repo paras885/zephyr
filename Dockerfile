@@ -17,7 +17,7 @@ RUN apk add --no-cache ca-certificates wget \
     && chown -R 10001:10001 /app
 
 WORKDIR /app
-COPY --chown=10001:10001 workflows/ /app/workflows/
+COPY --chown=10001:10001 examples/quickstart/ /app/workflows/
 
 USER 10001:10001
 EXPOSE 8080

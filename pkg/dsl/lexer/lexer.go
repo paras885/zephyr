@@ -105,17 +105,7 @@ func (lexer *Lexer) All() ([]Token, error) {
 }
 
 func (lexer *Lexer) Next() (Token, error) {
-	for lexer.index < len(lexer.source) {
-		if unicode.IsSpace(lexer.current()) {
-			lexer.advance()
-			continue
-		}
-		if lexer.current() == '/' && lexer.peek() == '/' {
-			lexer.skipComment()
-			continue
-		}
-		break
-	}
+	lexer.skipTrivia()
 	line, column := lexer.line, lexer.column
 	if lexer.index >= len(lexer.source) {
 		return Token{Kind: EOF, Line: line, Column: column}, nil
@@ -130,6 +120,26 @@ func (lexer *Lexer) Next() (Token, error) {
 	if character == '"' {
 		return lexer.string(line, column)
 	}
+	return lexer.operator(character, line, column)
+}
+
+// skipTrivia advances past whitespace and line comments preceding the next token.
+func (lexer *Lexer) skipTrivia() {
+	for lexer.index < len(lexer.source) {
+		if unicode.IsSpace(lexer.current()) {
+			lexer.advance()
+			continue
+		}
+		if lexer.current() == '/' && lexer.peek() == '/' {
+			lexer.skipComment()
+			continue
+		}
+		break
+	}
+}
+
+// operator lexes multi-character and single-character punctuation/operators.
+func (lexer *Lexer) operator(character rune, line, column int) (Token, error) {
 	if character == '-' && lexer.peek() == '>' {
 		lexer.advance()
 		lexer.advance()

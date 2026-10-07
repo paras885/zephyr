@@ -46,28 +46,8 @@ func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Re
 		http.Error(response, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	workflowID, ok := workflowIDFromPath(request.URL.Path)
+	workflowID, cursor, flusher, events, ok := handler.prepareStream(response, request)
 	if !ok {
-		http.NotFound(response, request)
-		return
-	}
-	cursor, err := parseCursor(request)
-	if err != nil {
-		http.Error(response, err.Error(), http.StatusBadRequest)
-		return
-	}
-	flusher, ok := response.(http.Flusher)
-	if !ok {
-		http.Error(response, "streaming is not supported", http.StatusInternalServerError)
-		return
-	}
-	events, err := handler.history.ListEvents(request.Context(), workflowID, cursor, handler.config.BatchSize)
-	if err != nil {
-		status := http.StatusInternalServerError
-		if errors.Is(err, store.ErrNotFound) {
-			status = http.StatusNotFound
-		}
-		http.Error(response, err.Error(), status)
 		return
 	}
 	response.Header().Set("Content-Type", "text/event-stream")
@@ -76,6 +56,38 @@ func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Re
 	response.Header().Set("X-Accel-Buffering", "no")
 	response.WriteHeader(http.StatusOK)
 	flusher.Flush()
+	handler.streamEvents(response, request, flusher, workflowID, cursor, events)
+}
+
+func (handler *Handler) prepareStream(response http.ResponseWriter, request *http.Request) (string, uint64, http.Flusher, []domain.Event, bool) {
+	workflowID, ok := workflowIDFromPath(request.URL.Path)
+	if !ok {
+		http.NotFound(response, request)
+		return "", 0, nil, nil, false
+	}
+	cursor, err := parseCursor(request)
+	if err != nil {
+		http.Error(response, err.Error(), http.StatusBadRequest)
+		return "", 0, nil, nil, false
+	}
+	flusher, ok := response.(http.Flusher)
+	if !ok {
+		http.Error(response, "streaming is not supported", http.StatusInternalServerError)
+		return "", 0, nil, nil, false
+	}
+	events, err := handler.history.ListEvents(request.Context(), workflowID, cursor, handler.config.BatchSize)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, store.ErrNotFound) {
+			status = http.StatusNotFound
+		}
+		http.Error(response, err.Error(), status)
+		return "", 0, nil, nil, false
+	}
+	return workflowID, cursor, flusher, events, true
+}
+
+func (handler *Handler) streamEvents(response http.ResponseWriter, request *http.Request, flusher http.Flusher, workflowID string, cursor uint64, events []domain.Event) {
 	ticker := time.NewTicker(handler.config.PollInterval)
 	defer ticker.Stop()
 	for {
@@ -97,6 +109,7 @@ func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Re
 		case <-request.Context().Done():
 			return
 		case <-ticker.C:
+			var err error
 			events, err = handler.history.ListEvents(request.Context(), workflowID, cursor, handler.config.BatchSize)
 			if err != nil {
 				return

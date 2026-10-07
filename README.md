@@ -21,17 +21,17 @@ Requires Go 1.27.1. Docker is optional and only needed for
 PostgreSQL/RabbitMQ integration tests.
 
 ```sh
-go run ./cmd/zephyr-server
+go run ./cmd/zephyr-server --workflows examples/quickstart
 ```
 
-This compiles the `.zephyr` files under `workflows/`, then serves the portal
-and HTTP API at `http://127.0.0.1:8080` using SQLite for local execution
-history. Open the portal, start a run, and watch it execute.
+This compiles the `.zephyr` files under `examples/quickstart/`, then serves
+the portal and HTTP API at `http://127.0.0.1:8080` using SQLite for local
+execution history. Open the portal, start a run, and watch it execute.
 
 Generate client/model/worker scaffolding for a workflow definition:
 
 ```sh
-go run ./cmd/zephyr workflow artifacts --file workflows/checkout.zephyr --output ./generated
+go run ./cmd/zephyr workflow artifacts --file examples/quickstart/checkout.zephyr --output ./generated
 ```
 
 This emits Go models, worker interfaces, a typed client, `.env.example`, plus
