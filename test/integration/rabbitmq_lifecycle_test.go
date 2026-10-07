@@ -426,7 +426,11 @@ func startRabbitLifecycleContainer(t *testing.T) (testcontainers.Container, stri
 			t.Errorf("terminate RabbitMQ lifecycle Testcontainer: %v", err)
 		}
 	})
-	amqpURL, err := container.Endpoint(ctx, "amqp")
+	// Use PortEndpoint with the explicit AMQP port rather than Endpoint, which
+	// picks the lowest-numbered port across *all* ports the rabbitmq image
+	// declares via EXPOSE (e.g. 4369/tcp for EPMD) even when that port was
+	// never published, causing a "port not found" error.
+	amqpURL, err := container.PortEndpoint(ctx, "5672/tcp", "amqp")
 	if err != nil {
 		t.Fatalf("get RabbitMQ AMQP endpoint: %v", err)
 	}
